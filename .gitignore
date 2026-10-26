@@ -1,0 +1,9 @@
+/target
+/adi2raw
+*.adi
+*.index
+*.img
+*.raw
+map.csv
+report.txt
+scan.txt
