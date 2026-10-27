@@ -55,6 +55,9 @@ size:     14720 bytes (0.00 GiB)
   first off: 0x0
   last end:  0x3790
 
+[layout]
+  legacy volume runs
+
 [volumes]
   v0 NTFS       lba 2048   sectors 4097   cluster 512   blocks 3  stored 1 KiB  label 'NTFS'
   v1 NTFS       lba 8192   sectors 8193   cluster 4096  blocks 2  stored 12 KiB label 'NTFS'
@@ -87,6 +90,19 @@ adi2raw dump backup.adi | sha256sum             # hash it without storing it
 adi2raw dump backup.adi | gzip > disk.img.gz    # compressed archive
 ```
 
+A plain `> disk.img` redirect is **not sparse**: stdout is a byte stream with
+no way to express holes, so the zero-filled gaps allocate real disk blocks. If
+you want a sparse image file, punch the holes as you write it:
+
+```bash
+adi2raw dump backup.adi | cp --sparse=always /dev/stdin disk.img
+# or, with GNU dd:
+adi2raw dump backup.adi | dd of=disk.img bs=4K iflag=fullblock conv=sparse status=progress
+```
+
+Do **not** use `conv=sparse` when writing to a raw device — skipping zero
+blocks would leave stale data on the target disk.
+
 `raw` is accepted as an alias for `dump`.
 
 ---
@@ -109,15 +125,62 @@ Concretely:
 Run `info` first to see how large the stream will be — it can be much larger
 than the `.adi` file, because zeros are expanded.
 
+### Multi-partition images
+
+AOMEI usually stores a whole multi-partition disk as **one** contiguous chain
+of blocks. Splitting volumes at gaps in that chain (the approach used by the
+original tool) finds only the first partition and drops every cluster past its
+end. `adi2raw` instead scans the whole decompressed stream for volume boot
+records. Each boot sector's `hidden_sectors` field gives that partition's
+absolute LBA; when they all agree on a constant stream origin, every cluster
+is placed at `stream offset + origin` and the GPT gets one entry per
+partition. If the stream already contains a protective MBR/GPT at LBA 0, it is
+kept rather than overwritten.
+
+The scan is one extra full decompression pass. `info` and `dump` print what
+they decided on stderr:
+
+```console
+adi2raw: boot sectors: 4
+adi2raw:   LBA 2048 (byte 1048576) at stream 0 -> origin 1048576  NTFS 1025 sectors
+  ...
+adi2raw: layout: whole-disk stream (origin 1048576 bytes)
+```
+
+If the boot-sector origins disagree, it falls back to the old volume-run
+mapping with a warning. Set `ADI2RAW_LEGACY_MAP=1` to force that fallback. If
+a real image is still misplaced, include those lines plus `adi2raw info` in a
+bug report.
+
 ### Why streaming needs extra work
 
 stdout is strictly sequential, but blocks in an `.adi` may be stored out of
-disk order. `adi2raw` plans every block's target offset up front, then uses a
-bounded reorder window (capped at 256 MiB) to emit bytes in order. For a
-normally ordered image the window stays almost empty, so there is no staging
-file and no large memory use. If an image needs more reordering than the cap
-allows, `dump` stops with an explicit error rather than emitting a corrupt
-stream; use `adi-extract reconstruct` to build a file in that case.
+disk order, and the LZ4 decoder must read them in chain order (each block can
+reference the previous 64 KiB of output). `adi2raw` plans every block's target
+offset up front, then uses a bounded in-memory reorder window. For a normally
+ordered image the window stays almost empty, so there is no staging file and no
+large memory use.
+
+If the window would exceed 256 MiB, `dump` switches to a **sparse temporary
+file**: the remaining clusters are written at their disk offsets with seeks,
+then the file is streamed to stdout in order and deleted. The output is
+byte-identical to the pure in-memory path (this is covered by a test). Note
+that in this mode stdout stays empty until the whole `.adi` has been decoded,
+so a piped `dd` will not start writing immediately.
+
+Three environment variables control the behaviour:
+
+| Variable | Meaning |
+| --- | --- |
+| `ADI2RAW_MAX_PENDING_MB` | In-memory reorder cap before spilling (default 256). |
+| `ADI2RAW_SPOOL_DIR` | Directory for the temporary file (default `$TMPDIR` / `/tmp`). |
+| `ADI2RAW_NO_SPOOL=1` | Refuse the spool and report the old error instead. |
+
+The spool is sparse on ext4/xfs/btrfs — only the clusters actually stored in
+the backup take up disk space, not the whole apparent image size. Pick
+`ADI2RAW_SPOOL_DIR` on a filesystem with enough free space; on some systems
+`/tmp` is a RAM-backed tmpfs, and a filesystem without sparse-file support
+would allocate the full apparent size.
 
 Rust ignores `SIGPIPE` by default, so when a consumer closes the pipe early
 (e.g. `head`) the next write fails with `EPIPE`. `adi2raw` treats that as a
@@ -164,11 +227,14 @@ Same constraints as the tool it is based on, plus streaming-specific ones:
 ./tests/run-tests.sh
 ```
 
-The suite builds the binary, generates synthetic `.adi` files (including a
-two-volume image with different cluster sizes, sparse bitmaps and out-of-order
-blocks), validates the GPT/MBR/NTFS structures in the output, checks marker
-bytes at their expected disk offsets, exercises a broken pipe, and runs a real
-`dump | dd` pipeline.
+The suite builds the binary, generates synthetic `.adi` files — including a
+two-volume image with different cluster sizes, a four-partition image stored as
+one contiguous chain, and an eight-block image stored in reverse disk order —
+validates the GPT/MBR/NTFS structures in the output, checks marker bytes at
+their expected disk offsets, exercises a broken pipe, and runs a real
+`dump | dd` pipeline. The four-partition case is a regression test for volume
+discovery; the reverse-order case checks that the sparse spool produces exactly
+the same bytes as the in-memory path and cleans up after itself.
 
 To also compare against the reference implementation:
 

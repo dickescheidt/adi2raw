@@ -277,7 +277,10 @@ pub struct BlockRec {
     pub csize: u32,
     pub crc: u32,
     pub stream: u32,
+    /// Region after `resolve_regions()` rewrote it.
     pub region: u32,
+    /// Region exactly as stored in the 32-byte index record (diagnostics).
+    pub raw_region: u32,
 }
 
 impl BlockRec {
@@ -294,6 +297,7 @@ fn parse_rec(p: &[u8]) -> BlockRec {
         crc: u32le(p, 16),
         stream: u32le(p, 20),
         region: u32le(p, 24),
+        raw_region: u32le(p, 24),
     }
 }
 
@@ -563,9 +567,96 @@ pub struct Volume {
     pub max_region: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Whole-stream boot-sector scan
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct BootHit {
+    pub stream_off: u64,
+    pub lba: u64,
+    pub sectors: u64,
+    pub cluster: u32,
+    pub fs: String,
+    pub label: String,
+}
+
+struct BootScan {
+    hits: Vec<BootHit>,
+    region0_has_mbr: bool,
+}
+
+/// AOMEI normally writes a multi-partition disk as one contiguous block chain.
+/// Grouping volumes by gaps in that chain therefore finds only the first
+/// partition. Walk the whole decompressed stream instead: every volume boot
+/// record carries its own partition start in `hidden_sectors`.
+fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
+    let mut out = BootScan {
+        hits: Vec::new(),
+        region0_has_mbr: false,
+    };
+    let mut dec = Lz4::new();
+    let mut seen = BTreeSet::new();
+    for (i, b) in blocks.iter().enumerate() {
+        if i == 0 || blocks[i - 1].end() != b.off {
+            dec.reset();
+        }
+        let comp = adi.read_at(adi.payload_offset() + b.off, b.csize as usize)?;
+        let data = match dec.decode(&comp) {
+            Ok(d) if d.len() == b.usize as usize => d,
+            _ => continue,
+        };
+        let lay = match split_block(&data, b.usize, 0) {
+            Some(l) if l.units != 0 && l.cluster >= 512 => l,
+            _ => continue,
+        };
+        let mut slot = 0usize;
+        for u in 0..(REGION / lay.cluster as u64) as u32 {
+            if slot >= lay.units as usize || !unit_present(&data, &lay, u) {
+                continue;
+            }
+            let src = lay.hdr as usize + slot * lay.cluster as usize;
+            slot += 1;
+            if src + lay.cluster as usize > data.len() {
+                break;
+            }
+            let cd = &data[src..src + lay.cluster as usize];
+            let stream_off = b.region as u64 * REGION + u as u64 * lay.cluster as u64;
+            if b.region == 0
+                && u == 0
+                && cd[510] == 0x55
+                && cd[511] == 0xAA
+                && (cd.get(450) == Some(&0xEE)
+                    || (cd.len() >= 1024 && &cd[512..520] == b"EFI PART"))
+            {
+                out.region0_has_mbr = true;
+            }
+            if let Some(bs) = parse_boot_sector(&cd[..512]) {
+                if bs.hidden != 0 && seen.insert(bs.hidden) {
+                    out.hits.push(BootHit {
+                        stream_off,
+                        lba: bs.hidden,
+                        sectors: bs.total_sectors + if bs.fs == "NTFS" { 1 } else { 0 },
+                        cluster: bs.cluster,
+                        fs: bs.fs,
+                        label: bs.label,
+                    });
+                }
+            }
+        }
+    }
+    out.hits.sort_by_key(|h| h.stream_off);
+    Ok(out)
+}
+
 pub struct SectorMap {
     pub disk_sectors: u64,
     pub volumes: Vec<Volume>,
+    /// Decompressed stream is a whole-disk coordinate space shifted by origin.
+    pub passthrough: bool,
+    pub origin: u64,
+    /// The stream already carries an MBR/GPT at LBA 0; do not synthesise one.
+    pub native_table: bool,
 }
 
 fn volume_ranges(blocks: &[BlockRec]) -> Vec<(usize, usize)> {
@@ -580,9 +671,112 @@ fn volume_ranges(blocks: &[BlockRec]) -> Vec<(usize, usize)> {
     out
 }
 
-/// Group index runs into volumes and read each volume's boot sector to learn
-/// its LBA, size and cluster size. Only the first few blocks are decompressed.
+/// Derive the volume map. Prefer a whole-stream boot-sector scan; fall back
+/// to grouping index runs into volumes when the boot sectors disagree.
 pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
+    let max_region = blocks.iter().map(|b| b.region).max().unwrap_or(0);
+    let stream_span = (max_region as u64 + 1) * REGION;
+    let scan = scan_boot_sectors(adi, blocks)?;
+    let force_legacy = std::env::var("ADI2RAW_LEGACY_MAP").is_ok();
+
+    // A boot sector's hidden_sectors is its absolute LBA. If every boot sector
+    // agrees on (LBA * 512 - stream offset), the decompressed stream is a
+    // whole-disk coordinate space shifted by one constant.
+    let delta = scan
+        .hits
+        .first()
+        .map(|h| h.lba as i128 * SECTOR as i128 - h.stream_off as i128);
+    let consistent = !force_legacy
+        && delta.is_some_and(|d| {
+            d >= 0
+                && scan
+                    .hits
+                    .iter()
+                    .all(|h| h.lba as i128 * SECTOR as i128 - h.stream_off as i128 == d)
+        });
+
+    eprintln!("adi2raw: boot sectors: {}", scan.hits.len());
+    for h in &scan.hits {
+        eprintln!(
+            "adi2raw:   LBA {} (byte {}) at stream {} -> origin {}  {} {} sectors",
+            h.lba,
+            h.lba * SECTOR,
+            h.stream_off,
+            h.lba as i128 * SECTOR as i128 - h.stream_off as i128,
+            if h.fs.is_empty() {
+                "raw"
+            } else {
+                h.fs.as_str()
+            },
+            h.sectors
+        );
+    }
+
+    if consistent {
+        let origin = delta.unwrap_or(0) as u64;
+        let native_table = origin == 0 && scan.region0_has_mbr;
+        eprintln!(
+            "adi2raw: layout: whole-disk stream (origin {origin} bytes){}",
+            if native_table {
+                ", native partition table preserved"
+            } else {
+                ""
+            }
+        );
+        let mut by_lba = scan.hits.clone();
+        by_lba.sort_by_key(|h| h.lba);
+        let end_lba = (origin + stream_span).div_ceil(SECTOR);
+        let mut volumes: Vec<Volume> = by_lba
+            .iter()
+            .map(|h| Volume {
+                first: 0,
+                last: blocks.len().saturating_sub(1),
+                fs: h.fs.clone(),
+                label: h.label.clone(),
+                cluster: if h.cluster == 0 { 512 } else { h.cluster },
+                data_base: 0,
+                lba: h.lba,
+                sectors: h.sectors,
+                stored: 0,
+                max_region,
+            })
+            .collect();
+        for i in 0..volumes.len() {
+            if volumes[i].sectors != 0 {
+                continue;
+            }
+            let end = if i + 1 < volumes.len() {
+                volumes[i + 1].lba
+            } else {
+                end_lba
+            };
+            if end > volumes[i].lba {
+                volumes[i].sectors = end - volumes[i].lba;
+            }
+        }
+        let volume_end = volumes.iter().map(|v| v.lba + v.sectors).max().unwrap_or(0);
+        let disk_sectors = volume_end.max(end_lba) + 34;
+        return Ok(SectorMap {
+            disk_sectors,
+            volumes,
+            passthrough: true,
+            origin,
+            native_table,
+        });
+    }
+
+    eprintln!(
+        "adi2raw: layout: legacy volume runs{}",
+        if force_legacy {
+            " (forced by ADI2RAW_LEGACY_MAP)"
+        } else if scan.hits.is_empty() {
+            " (no boot sectors found)"
+        } else {
+            " (boot-sector origins disagree; falling back to index-run volumes)"
+        }
+    );
+
+    // --- fallback: one volume per gap in the compressed block chain ---
     let mut volumes = Vec::new();
     for (first, last) in volume_ranges(blocks) {
         let mut v = Volume {
@@ -666,6 +860,9 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
     Ok(SectorMap {
         disk_sectors,
         volumes,
+        passthrough: false,
+        origin: 0,
+        native_table: false,
     })
 }
 
