@@ -61,16 +61,36 @@ fn entries(volumes: &[Volume]) -> Vec<u8> {
         if v.sectors == 0 || n >= 128 {
             continue;
         }
-        let (guid, name) = part_type(v, i + 1 == volumes.len());
+        let (fallback_guid, name) = part_type(v, i + 1 == volumes.len());
+        let recovered_type = v.type_guid.iter().any(|&b| b != 0);
+        let recovered_unique = v.unique_guid.iter().any(|&b| b != 0);
         let e = &mut ents[n * 128..(n + 1) * 128];
-        e[0..16].copy_from_slice(guid);
-        e[16..32].copy_from_slice(guid);
-        e[16] = 0xa0u8.wrapping_add(n as u8);
-        e[17] = 0x51u8.wrapping_add(n as u8);
+        e[0..16].copy_from_slice(if recovered_type {
+            &v.type_guid
+        } else {
+            fallback_guid
+        });
+        if recovered_unique {
+            e[16..32].copy_from_slice(&v.unique_guid);
+        } else {
+            e[16..32].copy_from_slice(if recovered_type {
+                &v.type_guid
+            } else {
+                fallback_guid
+            });
+            e[16] = 0xa0u8.wrapping_add(n as u8);
+            e[17] = 0x51u8.wrapping_add(n as u8);
+        }
         put64(e, 32, v.lba);
         put64(e, 40, v.lba + v.sectors - 1);
-        for (k, ch) in name.bytes().take(35).enumerate() {
-            e[56 + 2 * k] = ch;
+        if v.part_name.is_empty() {
+            for (k, ch) in name.bytes().take(35).enumerate() {
+                e[56 + 2 * k] = ch;
+            }
+        } else {
+            for (k, unit) in v.part_name.encode_utf16().take(36).enumerate() {
+                e[56 + 2 * k..58 + 2 * k].copy_from_slice(&unit.to_le_bytes());
+            }
         }
         n += 1;
     }

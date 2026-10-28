@@ -7,6 +7,7 @@ mod adi;
 mod crc;
 mod gpt;
 mod lz4;
+mod records;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -17,7 +18,7 @@ use std::process::ExitCode;
 
 use adi::{
     block_base, discover_map, scan_block_index, split_block, unit_present, Adi, BlockRec,
-    SectorMap, REGION, SECTOR,
+    SectorMap, Volume, REGION, SECTOR,
 };
 use lz4::Lz4;
 
@@ -345,7 +346,7 @@ fn block_writes(
     cluster_hint: u32,
     crc_bad: &mut u64,
 ) -> Result<Vec<(u64, Vec<u8>)>, String> {
-    let comp = adi.read_at(adi.payload_offset() + b.off, b.csize as usize)?;
+    let comp = adi.read_logical(b.off, b.csize as usize)?;
     let data = match dec.decode(&comp) {
         Ok(d) => d,
         Err(e) => {
@@ -477,8 +478,40 @@ fn plan_stats(plan: &Plan, blocks: &[BlockRec]) -> PlanStats {
 // Commands
 // ---------------------------------------------------------------------------
 
-fn open_and_map(path: &Path) -> Result<(Adi, Vec<BlockRec>, SectorMap), String> {
-    let mut adi = Adi::open(path)?;
+/// Real 0x201/0x202/0x109 record path, or the legacy signature-scan fallback.
+enum ImageMap {
+    Standard(records::StandardImage),
+    Legacy {
+        blocks: Vec<BlockRec>,
+        map: SectorMap,
+    },
+}
+
+struct Opened {
+    adi: Adi,
+    kind: ImageMap,
+}
+
+fn open_image(path: &Path) -> Result<Opened, String> {
+    let extra = records::extra_member_paths("ADI2RAW_MEMBERS");
+    let mut adi = Adi::open_with_members(path, &extra)?;
+    if env::var_os("ADI2RAW_LEGACY_ONLY").is_none() {
+        if let Some(std) = records::parse_standard(&mut adi)? {
+            eprintln!(
+                "adi2raw: standard record path: {} volume set(s), {} VDB entries, {} member(s)",
+                std.sets.len(),
+                std.blocks.len(),
+                adi.image_set.info().len()
+            );
+            return Ok(Opened {
+                adi,
+                kind: ImageMap::Standard(std),
+            });
+        }
+        eprintln!("adi2raw: no standard record sets; using legacy signature scan");
+    } else {
+        eprintln!("adi2raw: legacy signature scan forced by ADI2RAW_LEGACY_ONLY");
+    }
     let blocks = scan_block_index(&mut adi)?;
     if blocks.is_empty() {
         return Err("no block index records found — unsupported or damaged image".into());
@@ -490,12 +523,237 @@ fn open_and_map(path: &Path) -> Result<(Adi, Vec<BlockRec>, SectorMap), String> 
             map.disk_sectors
         ));
     }
-    Ok((adi, blocks, map))
+    Ok(Opened {
+        adi,
+        kind: ImageMap::Legacy { blocks, map },
+    })
+}
+
+fn standard_volumes(std: &records::StandardImage) -> Vec<Volume> {
+    std.volumes
+        .iter()
+        .map(|v| Volume {
+            first: 0,
+            last: std.blocks.len().saturating_sub(1),
+            fs: v.fs.clone(),
+            label: v.label.clone(),
+            cluster: v.cluster,
+            data_base: 0,
+            lba: v.lba,
+            sectors: v.sectors,
+            stored: 0,
+            max_region: 0,
+            type_guid: v.type_guid,
+            unique_guid: v.unique_guid,
+            part_name: v.part_name.clone(),
+        })
+        .collect()
+}
+
+/// Decode one VDB entry using its exact 0x109 geometry and image-set logical
+/// offset. Returns coalesced (absolute disk offset, bytes) writes.
+fn standard_writes(
+    adi: &mut Adi,
+    b: &records::StdBlock,
+    limit: u64,
+    compress: Option<u32>,
+    encrypt: Option<u32>,
+    counts: &mut (u64, u64), // (crc checked, crc bad)
+) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    let comp = adi.read_logical(b.off, b.csize as usize)?;
+    let data = if b.csize == b.usize {
+        comp
+    } else {
+        if encrypt.unwrap_or(0) != 0 {
+            return Err("encrypted images are not supported (0x106 mode != 0)".into());
+        }
+        if compress.is_some_and(|m| m != 0 && m != 1) {
+            return Err(format!(
+                "unsupported compression mode {} (0x105)",
+                compress.unwrap_or(0)
+            ));
+        }
+        Lz4::new()
+            .decode(&comp)
+            .map_err(|e| format!("block at 0x{:x}: {e}", b.off))?
+    };
+    if data.len() != b.usize as usize {
+        eprintln!(
+            "adi2raw: warn: block at 0x{:x} decoded to {} bytes, expected {}",
+            b.off,
+            data.len(),
+            b.usize
+        );
+        return Ok(Vec::new());
+    }
+    if b.crc != 0 {
+        counts.0 += 1;
+        if crc::br_crc32(&data) != b.crc {
+            counts.1 += 1;
+            eprintln!(
+                "adi2raw: warn: block at 0x{:x}: BRCrc32 mismatch (got 0x{:08x}, expected 0x{:08x}) — skipped",
+                b.off,
+                crc::br_crc32(&data),
+                b.crc
+            );
+            return Ok(Vec::new());
+        }
+    }
+
+    let bmp = b.bitmap_len as usize;
+    let cpb = b.clusters_per_block;
+    let cluster = b.cluster as usize;
+    if data.len() < bmp || cluster == 0 || cpb == 0 {
+        return Ok(Vec::new());
+    }
+    let present = |u: u32| -> bool {
+        let idx = (u >> 3) as usize;
+        idx < bmp && data[idx] & (1u8 << (u & 7)) != 0
+    };
+    let bytes_at = |u: u32| -> usize {
+        b.region_remaining
+            .saturating_sub(u as u64 * cluster as u64)
+            .min(cluster as u64) as usize
+    };
+    let pop = (0..cpb).filter(|&u| present(u)).count();
+    let bounded = bmp
+        + (0..cpb)
+            .filter(|&u| present(u))
+            .map(bytes_at)
+            .sum::<usize>();
+    let padded = data.len() == bmp + pop * cluster;
+    if b.region_remaining == 0 || (!padded && data.len() != bounded) {
+        return Err(format!(
+            "block at 0x{:x}: decoded size {} does not match 0x109 geometry (bounded {}, padded {})",
+            b.off, data.len(), bounded, bmp + pop * cluster
+        ));
+    }
+    let mut runs: Vec<(u64, usize, usize)> = Vec::new();
+    let mut src = bmp;
+    for u in 0..cpb {
+        if !present(u) {
+            continue;
+        }
+        let len = bytes_at(u);
+        let offset = src;
+        src += if padded { cluster } else { len };
+        let src = offset;
+        let dst = b.base + u as u64 * b.cluster as u64;
+        if len == 0 {
+            continue;
+        }
+        if dst + len as u64 > limit {
+            return Err(format!(
+                "block at 0x{:x}: write exceeds output boundary",
+                b.off
+            ));
+        }
+        if let Some(last) = runs.last_mut() {
+            if last.0 + last.2 as u64 == dst && last.1 + last.2 == src {
+                last.2 += len;
+                continue;
+            }
+        }
+        runs.push((dst, src, len));
+    }
+    Ok(runs
+        .into_iter()
+        .map(|(dst, src, len)| (dst, data[src..src + len].to_vec()))
+        .collect())
 }
 
 fn cmd_info(path: &Path) -> Result<(), String> {
-    let (adi, blocks, map) = open_and_map(path)?;
-    adi.print_info();
+    let opened = open_image(path)?;
+    opened.adi.print_info();
+    match &opened.kind {
+        ImageMap::Standard(std) => standard_info(&opened.adi, std),
+        ImageMap::Legacy { blocks, map } => legacy_info(&opened.adi, blocks, map),
+    }
+}
+
+fn standard_info(_adi: &Adi, std: &records::StandardImage) -> Result<(), String> {
+    println!("\n[standard records]");
+    println!("  volume record sets: {}", std.sets.len());
+    for (i, s) in std.sets.iter().enumerate() {
+        println!(
+            "  set {}: 0x201 @ 0x{:x}, 0x202 @ 0x{:x}, delta 0x{:x}, {} VDB entries",
+            i, s.volume_index_off, s.data_block_index_off, s.delta, s.entry_count
+        );
+        for r in &s.regions {
+            println!(
+                "    region {}: LBA {} + {} sectors, {} clusters/block x {} sectors/cluster x {} B (0x109 @ 0x{:x})",
+                r.reg_no,
+                r.block_begin_sector,
+                r.total_sectors,
+                r.clusters_per_block,
+                r.sectors_per_cluster,
+                r.bytes_per_sector,
+                r.off
+            );
+        }
+        for m in &s.metadata {
+            println!(
+                "    metadata: LBA {}, {} sectors, {} B/sector, label '{}' '{}' (0x102 @ 0x{:x})",
+                m.partition_start_sector,
+                m.partition_total_sectors,
+                m.bytes_per_sector,
+                m.label,
+                m.description,
+                m.off
+            );
+        }
+    }
+    println!(
+        "  modes:      compress {}, encrypt {}",
+        std.compress_mode
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        std.encrypt_mode
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".into())
+    );
+    println!(
+        "  crcs:       {} blocks carry a BRCrc32 checksum",
+        std.blocks.iter().filter(|b| b.crc != 0).count()
+    );
+    if std.skipped_regions != 0 {
+        println!(
+            "  skipped:    {} VDB entries with no matching region",
+            std.skipped_regions
+        );
+    }
+    println!("\n[volumes]");
+    for (i, v) in std.volumes.iter().enumerate() {
+        println!(
+            "  v{} {:<10} lba {:<12} sectors {:<12} cluster {:<6} blocks {} label '{}'",
+            i, v.fs, v.lba, v.sectors, v.cluster, v.blocks, v.label
+        );
+    }
+    let disk_size = std.disk_sectors * SECTOR;
+    println!("\n[raw image]");
+    println!("  disk:      {} sectors", std.disk_sectors);
+    println!(
+        "  size:      {} bytes ({:.2} GiB)",
+        disk_size,
+        disk_size as f64 / 1024.0 / 1024.0 / 1024.0
+    );
+    let bases: Vec<u64> = std.blocks.iter().map(|b| b.base).collect();
+    let inversions = bases.windows(2).filter(|w| w[1] < w[0]).count();
+    println!("\n[plan]");
+    println!(
+        "  blocks: {} in disk order: {}",
+        bases.len(),
+        if inversions == 0 { "yes" } else { "no" }
+    );
+    println!(
+        "  base range: {} .. {} bytes",
+        bases.first().copied().unwrap_or(0),
+        bases.last().copied().unwrap_or(0)
+    );
+    Ok(())
+}
+
+fn legacy_info(_adi: &Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(), String> {
     println!("\n[block index]");
     println!("  records:   {}", blocks.len());
     let crcs = blocks.iter().filter(|b| b.crc != 0).count();
@@ -530,14 +788,7 @@ fn cmd_info(path: &Path) -> Result<(), String> {
     for (i, v) in map.volumes.iter().enumerate() {
         println!(
             "  v{} {:<10} lba {:<12} sectors {:<12} cluster {:<6} blocks {} stored {} KiB label '{}'",
-            i,
-            v.fs,
-            v.lba,
-            v.sectors,
-            v.cluster,
-            v.last - v.first + 1,
-            v.stored / 1024,
-            v.label
+            i, v.fs, v.lba, v.sectors, v.cluster, v.last - v.first + 1, v.stored / 1024, v.label
         );
     }
     let disk_size = map.disk_sectors * SECTOR;
@@ -548,8 +799,8 @@ fn cmd_info(path: &Path) -> Result<(), String> {
         disk_size,
         disk_size as f64 / 1024.0 / 1024.0 / 1024.0
     );
-    let plan = build_plan(&map, &blocks);
-    let ps = plan_stats(&plan, &blocks);
+    let plan = build_plan(map, blocks);
+    let ps = plan_stats(&plan, blocks);
     let ordered = ps.inversions == 0;
     println!("\n[plan]");
     println!("  blocks: {} in {} chain run(s)", ps.blocks, ps.runs);
@@ -583,9 +834,87 @@ fn cmd_dump(path: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    let opened = open_image(path)?;
+    match opened.kind {
+        ImageMap::Standard(std) => dump_standard(opened.adi, &std),
+        ImageMap::Legacy { blocks, map } => dump_legacy(opened.adi, &blocks, &map),
+    }
+}
 
-    let (mut adi, blocks, map) = open_and_map(path)?;
-    let plan = build_plan(&map, &blocks);
+fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), String> {
+    if std.encrypt_mode.is_some_and(|m| m != 0) {
+        return Err("encrypted images are not supported (0x106 mode != 0)".into());
+    }
+    let disk_size = std.disk_sectors * SECTOR;
+    let volumes = standard_volumes(std);
+    let (prefix, suffix) = gpt::build(std.disk_sectors, &volumes);
+    let suffix_at = gpt::suffix_start(std.disk_sectors);
+    let plan: Plan = std
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(bi, b)| PlanEntry {
+            bi,
+            base: b.base,
+            cluster_hint: b.cluster,
+        })
+        .collect();
+    let fmin = future_min(&plan);
+    eprintln!(
+        "adi2raw: {} bytes ({:.2} GiB), {} volume(s), {} blocks -> stdout",
+        disk_size,
+        disk_size as f64 / 1024.0 / 1024.0 / 1024.0,
+        volumes.len(),
+        std.blocks.len()
+    );
+    let max_pending = env::var("ADI2RAW_MAX_PENDING_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(MAX_PENDING);
+    let stdout = io::stdout();
+    let mut st = Streamer::new(
+        BufWriter::with_capacity(1024 * 1024, stdout.lock()),
+        max_pending,
+    );
+    st.add(0, prefix)?;
+    st.add(suffix_at, suffix)?;
+    let mut counts = (0u64, 0u64);
+    for (i, b) in std.blocks.iter().enumerate() {
+        let writes = standard_writes(
+            &mut adi,
+            b,
+            disk_size,
+            std.compress_mode,
+            std.encrypt_mode,
+            &mut counts,
+        )?;
+        for (dst, bytes) in writes {
+            st.add(dst, bytes)?;
+        }
+        st.flush_to(fmin[i])?;
+        if st.broken {
+            break;
+        }
+    }
+    st.finish(disk_size)?;
+    eprintln!(
+        "adi2raw: BRCrc32: {} decoded blocks checked, {} mismatches",
+        counts.0, counts.1
+    );
+    if st.broken {
+        eprintln!("adi2raw: output pipe closed early");
+    } else if st.total != disk_size {
+        return Err(format!(
+            "internal error: wrote {} bytes, expected {}",
+            st.total, disk_size
+        ));
+    }
+    Ok(())
+}
+
+fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(), String> {
+    let plan = build_plan(map, blocks);
     let fmin = future_min(&plan);
     let disk_size = map.disk_sectors * SECTOR;
     let (prefix, suffix) = if map.native_table {
@@ -595,7 +924,7 @@ fn cmd_dump(path: &Path) -> Result<(), String> {
     };
     let suffix_at = gpt::suffix_start(map.disk_sectors);
 
-    let ps = plan_stats(&plan, &blocks);
+    let ps = plan_stats(&plan, blocks);
     eprintln!(
         "adi2raw: {} bytes ({:.2} GiB), {} volume(s), {} blocks -> stdout",
         disk_size,
@@ -604,11 +933,8 @@ fn cmd_dump(path: &Path) -> Result<(), String> {
         blocks.len()
     );
     eprintln!(
-        "adi2raw: plan: {} chain run(s), raw regions monotone {}, resolved {}, \
-         {} out-of-order steps, est. reorder need {} MiB",
+        "adi2raw: plan: {} chain run(s), {} out-of-order steps, est. reorder need {} MiB",
         ps.runs,
-        if ps.raw_monotone { "yes" } else { "no" },
-        if ps.resolved_monotone { "yes" } else { "no" },
         ps.inversions,
         ps.reorder_need / 1024 / 1024
     );
@@ -630,7 +956,6 @@ fn cmd_dump(path: &Path) -> Result<(), String> {
     let mut crc_bad = 0u64;
     for (pi, entry) in plan.iter().enumerate() {
         let b = &blocks[entry.bi];
-        // A gap in the compressed block chain starts a new LZ4 window.
         if entry.bi == 0 || blocks[entry.bi - 1].end() != b.off {
             dec.reset();
         }
@@ -685,6 +1010,9 @@ fn usage() -> String {
          adi2raw dump backup.adi | sha256sum\n\n\
          Diagnostics go to stderr; stdout carries only raw bytes.\n\
          Alias for dump: raw.\n\
+         Standard 0x201/0x202/0x109 records are used when present.\n\
+         Split image sets: ADI2RAW_MEMBERS=member1.adi:member2.adi\n\
+         Set ADI2RAW_LEGACY_ONLY=1 to force the signature-scan parser.\n\
          Set ADI2RAW_LEGACY_MAP=1 to force the old volume-run layout.\n\
          Out-of-order images spill to a sparse temp file; see ADI2RAW_SPOOL_DIR.",
         env!("CARGO_PKG_VERSION")

@@ -17,11 +17,13 @@ python3 tests/make_test_adi.py "$TMP/badcrc.adi" simple-badcrc
 python3 tests/make_multipart_adi.py "$TMP/multipart.adi"
 python3 tests/make_out_of_order_adi.py "$TMP/ooo.adi"
 python3 tests/make_gap_regions_adi.py "$TMP/gaps.adi"
+python3 tests/make_standard_adi.py "$TMP/standard.adi" single
+python3 tests/make_standard_adi.py "$TMP/split.adi" split
 
 echo "== info =="
-"$BIN" info "$TMP/simple.adi" | grep -q "blocks in disk order: yes"
-"$BIN" info "$TMP/multi.adi" | grep -q "blocks in disk order: no"
-"$BIN" info "$TMP/multipart.adi" | grep -q "whole-disk stream, origin 1048576 bytes"
+"$BIN" info "$TMP/simple.adi" | grep "blocks in disk order: yes" > /dev/null
+"$BIN" info "$TMP/multi.adi" | grep "blocks in disk order: no" > /dev/null
+"$BIN" info "$TMP/multipart.adi" | grep "whole-disk stream, origin 1048576 bytes" > /dev/null
 echo "info: OK"
 
 echo "== dump =="
@@ -45,7 +47,7 @@ python3 tests/check_multipart.py "$TMP/multipart.img" 4736512
 echo "multipart: OK"
 
 echo "== ordered index with chain gaps must stay ordered =="
-"$BIN" info "$TMP/simple.adi" | grep -q "out-of-order steps: 0"
+"$BIN" info "$TMP/simple.adi" | grep "out-of-order steps: 0" > /dev/null
 "$BIN" info "$TMP/gaps.adi" > "$TMP/gaps.info" 2> /dev/null
 grep -q "index regions monotone: raw yes, after resolve_regions yes" "$TMP/gaps.info"
 grep -q "estimated reorder need: 0 MiB" "$TMP/gaps.info"
@@ -90,6 +92,36 @@ echo "== stdout is clean binary =="
 size=$(wc -c < "$TMP/simple.img")
 [[ "$size" -eq 3163648 ]] && echo "stdout bytes: OK"
 
+echo "== standard 0x201/0x202/0x109 records =="
+"$BIN" info "$TMP/standard.adi" > "$TMP/standard.info" 2> "$TMP/standard.info.err"
+grep -q "standard record path" "$TMP/standard.info.err"
+grep -q "volume record sets: 1" "$TMP/standard.info"
+grep -q "delta 0x65c" "$TMP/standard.info"
+grep -q "8 clusters/block x 64 sectors/cluster x 512 B" "$TMP/standard.info"
+grep -q "metadata: LBA 2048, 4096 sectors" "$TMP/standard.info"
+grep -q "modes:      compress 1, encrypt 0" "$TMP/standard.info"
+grep -q "BRCrc32 valid" "$TMP/standard.info"
+"$BIN" dump "$TMP/standard.adi" > "$TMP/standard.img" 2> "$TMP/standard.err"
+grep -q "2 decoded blocks checked, 0 mismatches" "$TMP/standard.err"
+python3 tests/check_standard.py "$TMP/standard.img" 3163136
+echo "standard records: OK"
+
+echo "== image-set member offset translation (split set) =="
+MEMBER="$TMP/split.adi.member1.adi"
+ADI2RAW_MEMBERS="$MEMBER" "$BIN" info "$TMP/split.adi" > "$TMP/split.info" 2> "$TMP/split.info.err"
+grep -q "2 member(s)" "$TMP/split.info.err"
+grep -q "logical 0x20700..0x30800" "$TMP/split.info"
+ADI2RAW_MEMBERS="$MEMBER" "$BIN" dump "$TMP/split.adi" > "$TMP/split.img" 2> "$TMP/split.err"
+grep -q "2 decoded blocks checked, 0 mismatches" "$TMP/split.err"
+python3 tests/check_standard.py "$TMP/split.img" 3163136
+cmp "$TMP/standard.img" "$TMP/split.img"
+# Without the extra member, the second block cannot be read: fail loudly.
+if ADI2RAW_NO_SPOOL=1 "$BIN" dump "$TMP/split.adi" > /dev/null 2> "$TMP/missing.err"; then
+    echo "missing image-set member was not detected"; exit 1
+fi
+grep -q "not covered by any member" "$TMP/missing.err"
+echo "split image set: OK"
+
 echo "== broken pipe =="
 set +e
 "$BIN" dump "$TMP/multi.adi" 2>/dev/null | head -c 1024 > /dev/null
@@ -108,15 +140,21 @@ if [[ -n "${ADI_EXTRACT:-}" && -x "$ADI_EXTRACT" ]]; then
     echo "== reference comparison (C++ adi-extract) =="
     # The multipart comparison needs a C++ build with the whole-disk
     # boot-sector scan (the POSIX fork at dickescheidt/adi-extract).
-    for kind in simple multi multipart bigcluster ooo; do
+    for kind in simple multi multipart bigcluster ooo standard; do
         src="$TMP/$kind.adi"
         "$ADI_EXTRACT" reconstruct "$src" "$TMP/cpp-$kind.img" > /dev/null 2>&1
         rm -f "$src.index"
         cmp "$TMP/cpp-$kind.img" "$TMP/$kind.img"
         echo "$kind: byte-identical to C++ output"
     done
+    ADI_EXTRACT_MEMBERS="$TMP/split.adi.member1.adi" \
+        "$ADI_EXTRACT" reconstruct "$TMP/split.adi" "$TMP/cpp-split.img" > /dev/null 2>&1
+    cmp "$TMP/cpp-split.img" "$TMP/split.img"
+    echo "split: byte-identical to C++ output"
 else
     echo "tip: ADI_EXTRACT=/path/to/adi-extract $0 also compares against the C++ tool"
 fi
 
 echo "ALL TESTS PASSED"
+
+python3 tests/test_boundary.py ./target/release/adi2raw rust

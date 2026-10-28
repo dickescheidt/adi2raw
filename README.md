@@ -73,6 +73,42 @@ size:     14720 bytes (0.00 GiB)
 reconstructed, and whether blocks are already in disk order. It does not modify
 anything.
 
+### Standard records and split image sets
+
+Real AOMEI images contain a **standard record stream**: a 0x201 volume index,
+a 0x202 data-block index, 0x109 region geometry, 0x102 volume metadata and
+0x105/0x106 compression/encryption modes. Each 16-byte record header carries
+its own `BRCrc32`, and only CRC-valid records are trusted.
+
+`adi2raw` scans for those records first. When it finds a complete volume
+record set, it reads the real 0x20-byte VDB entries directly, so `RegNo` and
+`BlockNo` are known rather than inferred. The 0x109 record gives the exact
+bitmap length and cluster size; the 0x102 record gives the partition's
+absolute start LBA, size, GPT type GUID, unique GUID and label, which are used
+verbatim in the synthesised GPT. Blocks whose decoded bytes fail their VDB
+`Crc32` are warned about and skipped.
+
+`ImgOffset` in a VDB entry is a **logical image-set offset**, not a raw file
+offset. Reads go through the member formula
+`physical = logical - DataOffInSet + BIFH.size`, where `DataOffInSet` and
+`DataLenInSet` come from the BIFT tail (`+0x628` / `+0x620`). For split backups,
+pass the extra members as a colon-separated list:
+
+```bash
+ADI2RAW_MEMBERS="Backup1.adi:Backup2.adi" adi2raw dump Backup.adi | dd of=/dev/sdX bs=1M
+```
+
+`info` prints each member's logical range. Members must form a contiguous
+logical range; a read outside every member fails loudly rather than seeking to
+the wrong file offset. Set `ADI2RAW_LEGACY_ONLY=1` to force the older
+signature-scan parser, which is also the automatic fallback when an image has
+no CRC-valid record sets (older generations and synthetic images).
+
+Standard-record blocks are bounded by their `0x109` region length. Short final
+blocks, including a partial final cluster, are supported; padded blocks are
+clipped to the region boundary. Other decoded geometry mismatches stop extraction
+with an error instead of silently omitting the block.
+
 ### Block checksums
 
 Each 0x20-byte VDB index entry ends with a `BRCrc32` over the block's
@@ -237,13 +273,15 @@ Same constraints as the tool it is based on, plus streaming-specific ones:
   is a linear pass over the `.adi` — fine for a one-off conversion, but it is
   the dominant cost on very large backups.
 * If blocks are wildly out of order, `dump` spills to a sparse temp file. Set
-  `ADI2RAW_NO_SPOOL=1` to make that an error instead. The block-index signature
-  scan and the standard `0x201`/`0x202`/`0x109` record path are not parsed, so
-  split image sets and images whose `ImgOffset` is not a raw file offset are not
-  supported.
-* Per-block `BRCrc32` values are verified. Header/footer CRC fields are parsed
-  and displayed but not verified — there is no published checksum algorithm for
-  the container.
+  `ADI2RAW_NO_SPOOL=1` to make that an error instead.
+* Split image sets need their extra members supplied explicitly via
+  `ADI2RAW_MEMBERS`; they are not auto-discovered by filename.
+* Only compression mode 1 (AOMEI LZ4) and direct (uncompressed) blocks are
+  supported; encryption mode 0 is required. Other 0x105/0x106 modes are
+  rejected with a clear error instead of producing garbage.
+* Per-block `BRCrc32` values are verified. BIFH/BIFT and standard-record CRCs
+  are also checked and reported, but are not required to be valid (some older
+  images carry none).
 
 ---
 
@@ -257,7 +295,10 @@ The suite builds the binary, generates synthetic `.adi` files — including a
 two-volume image with different cluster sizes, a four-partition image stored as
 one contiguous chain, an image with a deliberately wrong block checksum, a
 32 KiB-cluster image with a sparse one-byte bitmap, an ordered index with chain
-gaps, and an eight-block image stored in reverse disk order — validates the
+gaps, an eight-block image stored in reverse disk order, a **real-format image**
+with CRC-valid 0x201/0x202/0x102/0x105/0x106/0x109 records and a 0x20-byte VDB
+table, and a **split image set** whose second stored block lives in a second
+member file — validates the
 GPT/MBR/NTFS structures in the output, checks marker bytes at their expected
 disk offsets, exercises a broken pipe, and runs a real `dump | dd` pipeline.
 The four-partition case is a regression test for volume discovery; the

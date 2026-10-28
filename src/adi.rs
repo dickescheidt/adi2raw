@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::lz4::Lz4;
 
@@ -16,23 +16,23 @@ pub const SECTOR: u64 = 512;
 
 type Result<T> = std::result::Result<T, String>;
 
-fn u16le(b: &[u8], o: usize) -> u16 {
+pub(crate) fn u16le(b: &[u8], o: usize) -> u16 {
     b.get(o..o + 2)
         .map(|s| u16::from_le_bytes([s[0], s[1]]))
         .unwrap_or(0)
 }
-fn u32le(b: &[u8], o: usize) -> u32 {
+pub(crate) fn u32le(b: &[u8], o: usize) -> u32 {
     b.get(o..o + 4)
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
         .unwrap_or(0)
 }
-fn u64le(b: &[u8], o: usize) -> u64 {
+pub(crate) fn u64le(b: &[u8], o: usize) -> u64 {
     b.get(o..o + 8)
         .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
         .unwrap_or(0)
 }
 
-fn utf16le_z(b: &[u8]) -> String {
+pub(crate) fn utf16le_z(b: &[u8]) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i + 1 < b.len() {
@@ -79,6 +79,7 @@ fn ascii(b: &[u8]) -> String {
 pub struct Header {
     pub size: u32,
     pub checksum: u32,
+    pub crc_valid: bool,
     pub guid_a: [u8; 16],
     pub guid_b: [u8; 16],
     pub comment: String,
@@ -89,6 +90,11 @@ pub struct Header {
 pub struct Footer {
     pub checksum: u32,
     pub size: u32,
+    pub crc_valid: bool,
+    /// BIFT +0x620 / +0x628: this member's range inside the image set.
+    pub data_length_in_set: u64,
+    pub data_offset_in_set: u64,
+    pub has_image_set: bool,
     pub offset_a: u64,
     pub offset_b: u64,
     pub field_a: u32,
@@ -99,16 +105,143 @@ pub struct Footer {
     pub filename: String,
 }
 
+/// One `.adi` member and the logical image-set range it backs.
+pub struct ImageSetMemberInfo {
+    pub path: String,
+    pub logical_start: u64,
+    pub data_length: u64,
+    pub header_size: u64,
+}
+
+struct MemberState {
+    file: File,
+    path: String,
+    logical_start: u64,
+    data_length: u64,
+    header_size: u64,
+}
+
+/// AOMEI's `m_pImgSet->ReadData`: a *logical* offset is not a file offset.
+/// For the member whose `[DataOffInSet, +DataLenInSet)` contains it, the
+/// physical read is `header_size + (logical - DataOffInSet)` inside that
+/// member. Reads may span two adjacent members of a split image set.
+pub struct ImageSet {
+    members: Vec<MemberState>,
+}
+
+/// Minimal container read used for additional image-set members.
+fn container_fields(path: &Path) -> Result<(u64, u64, u64, u64, u64)> {
+    let mut f = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let size = f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    if size < 32 {
+        return Err(format!(
+            "{} is too small to be an .adi member",
+            path.display()
+        ));
+    }
+    let mut head = [0u8; 16];
+    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut head).map_err(|e| e.to_string())?;
+    if &head[0..4] != b"BIFH" {
+        return Err(format!("{} has no BIFH header", path.display()));
+    }
+    let hsize = u32le(&head, 4) as u64;
+    let mut tail = [0u8; 16];
+    f.seek(SeekFrom::Start(size - 16))
+        .map_err(|e| e.to_string())?;
+    f.read_exact(&mut tail).map_err(|e| e.to_string())?;
+    if &tail[12..16] != b"BIFT" {
+        return Err(format!("{} has no BIFT footer", path.display()));
+    }
+    let tsize = u32le(&tail, 8) as u64;
+    let (doff, dlen) = if tsize >= 0x630 && tsize <= size {
+        let mut blob = vec![0u8; tsize as usize];
+        f.seek(SeekFrom::Start(size - tsize))
+            .map_err(|e| e.to_string())?;
+        f.read_exact(&mut blob).map_err(|e| e.to_string())?;
+        (u64le(&blob, 0x628), u64le(&blob, 0x620))
+    } else {
+        (0, 0)
+    };
+    Ok((hsize, tsize, doff, dlen, size))
+}
+
+impl ImageSet {
+    pub fn from_paths(paths: &[PathBuf]) -> Result<Self> {
+        let mut members = Vec::new();
+        for p in paths {
+            let (hsize, tsize, doff, dlen, fsize) = container_fields(p)?;
+            let payload = fsize.saturating_sub(hsize + tsize);
+            let data_length = if dlen > 0 { dlen.min(payload) } else { payload };
+            let file = File::open(p).map_err(|e| format!("cannot open {}: {e}", p.display()))?;
+            members.push(MemberState {
+                file,
+                path: p.display().to_string(),
+                logical_start: doff,
+                data_length,
+                header_size: hsize,
+            });
+        }
+        members.sort_by_key(|m| m.logical_start);
+        if members.is_empty() {
+            return Err("image set has no members".into());
+        }
+        Ok(Self { members })
+    }
+
+    pub fn info(&self) -> Vec<ImageSetMemberInfo> {
+        self.members
+            .iter()
+            .map(|m| ImageSetMemberInfo {
+                path: m.path.clone(),
+                logical_start: m.logical_start,
+                data_length: m.data_length,
+                header_size: m.header_size,
+            })
+            .collect()
+    }
+
+    pub fn read(&mut self, logical: u64, len: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len);
+        let mut cur = logical;
+        while out.len() < len {
+            let Some(m) = self
+                .members
+                .iter_mut()
+                .find(|m| cur >= m.logical_start && cur < m.logical_start + m.data_length)
+            else {
+                return Err(format!(
+                    "image-set offset 0x{cur:x} is not covered by any member"
+                ));
+            };
+            let avail =
+                (m.logical_start + m.data_length - cur).min((len - out.len()) as u64) as usize;
+            let physical = m.header_size + (cur - m.logical_start);
+            m.file
+                .seek(SeekFrom::Start(physical))
+                .map_err(|e| format!("member seek {physical}: {e}"))?;
+            let mut buf = vec![0u8; avail];
+            m.file
+                .read_exact(&mut buf)
+                .map_err(|e| format!("member read {physical}+{avail}: {e}"))?;
+            out.extend_from_slice(&buf);
+            cur += avail as u64;
+        }
+        Ok(out)
+    }
+}
+
 pub struct Adi {
     file: File,
     pub path: String,
     pub file_size: u64,
     pub header: Header,
     pub footer: Footer,
+    pub image_set: ImageSet,
 }
 
 impl Adi {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open_with_members(path: &Path, extra: &[PathBuf]) -> Result<Self> {
         let mut file =
             File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
         let file_size = file
@@ -146,9 +279,12 @@ impl Adi {
         } else {
             String::new()
         };
+        let mut header_crc_check = hdr.clone();
+        header_crc_check[8..12].copy_from_slice(&[0; 4]);
         let header = Header {
             size: hsize,
             checksum: hchecksum,
+            crc_valid: crate::crc::br_crc32(&header_crc_check) == hchecksum,
             guid_a,
             guid_b,
             comment,
@@ -171,9 +307,30 @@ impl Adi {
         file.seek(SeekFrom::Start(file_size - fsize as u64))
             .map_err(|e| e.to_string())?;
         file.read_exact(&mut blob).map_err(|e| e.to_string())?;
+        let mut tail_crc_check = blob.clone();
+        if tail_crc_check.len() >= 12 {
+            let e = tail_crc_check.len() - 12;
+            tail_crc_check[e..e + 4].copy_from_slice(&[0; 4]);
+        }
+        // BIFT +0x620 / +0x628 hold this member's logical image-set range.
+        // sizeof(BR_IMAGE_FILE_TAIL) is 0x674 in real images; our synthetic
+        // fixtures use a 16-byte footer and have no such fields.
+        let has_image_set = blob.len() >= 0x630;
         let mut footer = Footer {
             checksum,
             size: fsize,
+            crc_valid: crate::crc::br_crc32(&tail_crc_check) == checksum,
+            data_length_in_set: if has_image_set {
+                u64le(&blob, 0x620)
+            } else {
+                0
+            },
+            data_offset_in_set: if has_image_set {
+                u64le(&blob, 0x628)
+            } else {
+                0
+            },
+            has_image_set,
             offset_a: 0,
             offset_b: 0,
             field_a: 0,
@@ -197,12 +354,21 @@ impl Adi {
             footer.comment = utf16le_z(&blob[0x410..]);
         }
 
+        let mut paths = vec![path.to_path_buf()];
+        for p in extra {
+            if !paths.contains(p) {
+                paths.push(p.clone());
+            }
+        }
+        let image_set = ImageSet::from_paths(&paths)?;
+
         Ok(Self {
             file,
             path: path.display().to_string(),
             file_size,
             header,
             footer,
+            image_set,
         })
     }
 
@@ -218,6 +384,7 @@ impl Adi {
         }
     }
 
+    /// Physical read in the primary member (used for record/header scans).
     pub fn read_at(&mut self, off: u64, len: usize) -> Result<Vec<u8>> {
         self.file
             .seek(SeekFrom::Start(off))
@@ -227,6 +394,12 @@ impl Adi {
             .read_exact(&mut buf)
             .map_err(|e| format!("read {off}+{len}: {e}"))?;
         Ok(buf)
+    }
+
+    /// Image-set logical read. `ImgOffset` values in VDB entries are logical,
+    /// not raw file offsets; this is the `m_pImgSet->ReadData` translation.
+    pub fn read_logical(&mut self, off: u64, len: usize) -> Result<Vec<u8>> {
+        self.image_set.read(off, len)
     }
 
     pub fn print_info(&self) {
@@ -242,7 +415,15 @@ impl Adi {
             "  size:      {} (0x{:x})",
             self.header.size, self.header.size
         );
-        println!("  checksum:  0x{:x}", self.header.checksum);
+        println!(
+            "  checksum:  0x{:x} ({})",
+            self.header.checksum,
+            if self.header.crc_valid {
+                "BRCrc32 valid"
+            } else {
+                "not BRCrc32"
+            }
+        );
         println!("  guid A:    {}", guid_str(&self.header.guid_a));
         println!("  guid B:    {}", guid_str(&self.header.guid_b));
         println!("  comment:   {}", self.header.comment);
@@ -254,7 +435,32 @@ impl Adi {
             "  size:      {} (0x{:x})",
             self.footer.size, self.footer.size
         );
-        println!("  checksum:  0x{:x}", self.footer.checksum);
+        println!(
+            "  checksum:  0x{:x} ({})",
+            self.footer.checksum,
+            if self.footer.crc_valid {
+                "BRCrc32 valid"
+            } else {
+                "not BRCrc32"
+            }
+        );
+        if self.footer.has_image_set {
+            println!(
+                "  image set: DataOffInSet 0x{:x}, DataLenInSet 0x{:x}",
+                self.footer.data_offset_in_set, self.footer.data_length_in_set
+            );
+        }
+        println!("\n[image-set members]");
+        for m in self.image_set.info() {
+            println!(
+                "  {} logical 0x{:x}..0x{:x} ({} bytes), BIFH 0x{:x}",
+                m.path,
+                m.logical_start,
+                m.logical_start + m.data_length,
+                m.data_length,
+                m.header_size
+            );
+        }
         println!("  offset A:  0x{:x}", self.footer.offset_a);
         println!("  offset B:  0x{:x}", self.footer.offset_b);
         println!("  field A:   {}", self.footer.field_a);
@@ -572,6 +778,11 @@ pub struct Volume {
     pub sectors: u64,
     pub stored: u64,
     pub max_region: u32,
+    /// Recovered from a 0x102 volume-metadata record (zero => guess).
+    pub type_guid: [u8; 16],
+    pub unique_guid: [u8; 16],
+    /// UTF-16 GPT partition name recovered from 0x102 (empty => guess).
+    pub part_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -612,7 +823,7 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
         if i == 0 || blocks[i - 1].end() != b.off {
             dec.reset();
         }
-        let comp = adi.read_at(adi.payload_offset() + b.off, b.csize as usize)?;
+        let comp = adi.read_logical(b.off, b.csize as usize)?;
         let data = match dec.decode(&comp) {
             Ok(d) if d.len() == b.usize as usize => d,
             _ => continue,
@@ -760,6 +971,9 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
                 sectors: h.sectors,
                 stored: 0,
                 max_region,
+                type_guid: [0; 16],
+                unique_guid: [0; 16],
+                part_name: String::new(),
             })
             .collect();
         for i in 0..volumes.len() {
@@ -817,12 +1031,15 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
                 .map(|b| b.region)
                 .max()
                 .unwrap_or(0),
+            type_guid: [0; 16],
+            unique_guid: [0; 16],
+            part_name: String::new(),
         };
         let mut dec = Lz4::new();
         let mut probe_cluster = 0u32;
         let stop = std::cmp::min(last + 1, first + 512);
         for b in &blocks[first..stop] {
-            let comp = adi.read_at(adi.payload_offset() + b.off, b.csize as usize)?;
+            let comp = adi.read_logical(b.off, b.csize as usize)?;
             let data = dec.decode(&comp).unwrap_or_default();
             if data.len() != b.usize as usize || !b.crc_ok(&data) {
                 continue;
