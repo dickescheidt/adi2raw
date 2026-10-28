@@ -379,6 +379,21 @@ For a longer reproducible placement run:
 python3 tests/test_properties.py ./target/release/adi2raw rust --seeds 200
 ```
 
+### Coverage-guided fuzzing
+
+Optional cargo-fuzz harnesses harden the record parsers, the LZ4 decoder and the whole
+container path against malformed input. They are not part of the default test suite;
+see [`tests/fuzz/README.md`](tests/fuzz/README.md) for prerequisites, targets and the
+recorded campaign. Run them with:
+
+```bash
+sh tests/fuzz/run.sh 90
+```
+
+The 2026-10-28 campaign executed about 9.5 million cases under libFuzzer with
+AddressSanitizer and found no crash, hang or sanitizer report. Fuzzing cannot validate
+the format itself and does not replace a real AOMEI restore comparison.
+
 ### Offset-only debug trace
 
 For the standard-record extraction path, `--debug` also emits `trace:` lines
