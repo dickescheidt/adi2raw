@@ -3,6 +3,16 @@
 //!   adi2raw info <file.adi>     describe the image
 //!   adi2raw dump <file.adi>     write a raw disk image to stdout
 
+// Optional format-audit diagnostics. Operational corruption warnings remain unconditional.
+static DEBUG_DIAGNOSTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+macro_rules! debug_warn {
+    ($($arg:tt)*) => {
+        if crate::DEBUG_DIAGNOSTICS.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 mod adi;
 mod crc;
 mod gpt;
@@ -363,6 +373,12 @@ fn block_writes(
         );
         return Ok(Vec::new());
     }
+    if b.crc == 0 {
+        debug_warn!(
+            "adi2raw: warn: block at 0x{:x}: no decoded checksum; contents need verification",
+            b.off
+        );
+    }
     if !b.crc_ok(&data) {
         *crc_bad += 1;
         eprintln!(
@@ -395,6 +411,7 @@ fn block_writes(
         let dst = base + u as u64 * lay.cluster as u64;
         slot += 1;
         if dst + lay.cluster as u64 > limit {
+            debug_warn!("adi2raw: warn: block at 0x{:x}: cluster at output 0x{:x} exceeds volume boundary; skipped; output needs verification", b.off, dst);
             continue;
         }
         let len = lay.cluster as usize;
@@ -495,8 +512,10 @@ struct Opened {
 fn open_image(path: &Path) -> Result<Opened, String> {
     let extra = records::extra_member_paths("ADI2RAW_MEMBERS");
     let mut adi = Adi::open_with_members(path, &extra)?;
+    debug_warn!("adi2raw: warn: disk extent/layout is inferred and GPT may be reconstructed, not an exact original-disk restore; block checksums do not verify placement; verify layout and filesystem before use");
     if env::var_os("ADI2RAW_LEGACY_ONLY").is_none() {
         if let Some(std) = records::parse_standard(&mut adi)? {
+            debug_warn!("adi2raw: warn: standard-path filesystem type display is inferred from volume labels, not verified filesystem contents");
             eprintln!(
                 "adi2raw: standard record path: {} volume set(s), {} VDB entries, {} member(s)",
                 std.sets.len(),
@@ -512,6 +531,7 @@ fn open_image(path: &Path) -> Result<Opened, String> {
     } else {
         eprintln!("adi2raw: legacy signature scan forced by ADI2RAW_LEGACY_ONLY");
     }
+    debug_warn!("adi2raw: warn: legacy signature scan uses inferred geometry and placement; output needs further verification");
     let blocks = scan_block_index(&mut adi)?;
     if blocks.is_empty() {
         return Err("no block index records found — unsupported or damaged image".into());
@@ -573,6 +593,9 @@ fn standard_writes(
                 compress.unwrap_or(0)
             ));
         }
+        if compress == Some(0) {
+            debug_warn!("adi2raw: warn: block at 0x{:x}: compression mode 0 but unequal stored/decoded sizes; attempting LZ4; verify output", b.off);
+        }
         Lz4::new()
             .decode(&comp)
             .map_err(|e| format!("block at 0x{:x}: {e}", b.off))?
@@ -604,6 +627,7 @@ fn standard_writes(
     let cpb = b.clusters_per_block;
     let cluster = b.cluster as usize;
     if data.len() < bmp || cluster == 0 || cpb == 0 {
+        debug_warn!("adi2raw: warn: block at 0x{:x}: invalid bitmap/geometry; skipped; output needs verification", b.off);
         return Ok(Vec::new());
     }
     let present = |u: u32| -> bool {
@@ -663,6 +687,7 @@ fn standard_writes(
 }
 
 fn cmd_info(path: &Path) -> Result<(), String> {
+    debug_warn!("adi2raw: warn: info does not verify all decoded block contents/checksums; use extraction diagnostics and independent filesystem checks");
     let opened = open_image(path)?;
     opened.adi.print_info();
     match &opened.kind {
@@ -1008,6 +1033,7 @@ fn usage() -> String {
          adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress\n  \
          adi2raw dump backup.adi > disk.img\n  \
          adi2raw dump backup.adi | sha256sum\n\n\
+         --debug enables extended format-audit diagnostics on stderr.\n\
          Diagnostics go to stderr; stdout carries only raw bytes.\n\
          Alias for dump: raw.\n\
          Standard 0x201/0x202/0x109 records are used when present.\n\
@@ -1020,7 +1046,17 @@ fn usage() -> String {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let mut args = Vec::new();
+    let mut options = true;
+    for (i, arg) in env::args().enumerate() {
+        if i != 0 && options && arg == "--" {
+            options = false;
+        } else if i != 0 && options && arg == "--debug" {
+            DEBUG_DIAGNOSTICS.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            args.push(arg);
+        }
+    }
     let result = match (args.get(1).map(String::as_str), args.len()) {
         (Some("-h" | "--help" | "help"), _) => {
             println!("{}", usage());

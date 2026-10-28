@@ -154,6 +154,33 @@ fn container_fields(path: &Path) -> Result<(u64, u64, u64, u64, u64)> {
         return Err(format!("{} has no BIFT footer", path.display()));
     }
     let tsize = u32le(&tail, 8) as u64;
+    if hsize < 16 || hsize > size || tsize < 16 || tsize > size - hsize {
+        return Err(format!("{}: invalid container sizes", path.display()));
+    }
+    let mut hdr = vec![0u8; hsize as usize];
+    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
+    let expected = u32le(&hdr, 8);
+    hdr[8..12].fill(0);
+    if crate::crc::br_crc32(&hdr) != expected {
+        debug_warn!(
+            "adi2raw: warn: {}: BIFH checksum unverified/mismatched; metadata needs verification",
+            path.display()
+        );
+    }
+    let mut footer = vec![0u8; tsize as usize];
+    f.seek(SeekFrom::Start(size - tsize))
+        .map_err(|e| e.to_string())?;
+    f.read_exact(&mut footer).map_err(|e| e.to_string())?;
+    let expected = u32le(&footer, footer.len() - 12);
+    let pos = footer.len() - 12;
+    footer[pos..pos + 4].fill(0);
+    if crate::crc::br_crc32(&footer) != expected {
+        debug_warn!(
+            "adi2raw: warn: {}: BIFT checksum unverified/mismatched; metadata needs verification",
+            path.display()
+        );
+    }
     let (doff, dlen) = if tsize >= 0x630 && tsize <= size {
         let mut blob = vec![0u8; tsize as usize];
         f.seek(SeekFrom::Start(size - tsize))
@@ -172,6 +199,9 @@ impl ImageSet {
         for p in paths {
             let (hsize, tsize, doff, dlen, fsize) = container_fields(p)?;
             let payload = fsize.saturating_sub(hsize + tsize);
+            if tsize < 0x630 || dlen == 0 || dlen > payload {
+                debug_warn!("adi2raw: warn: {}: absent/invalid image-set length; using physical payload bounds; verify member mapping", p.display());
+            }
             let data_length = if dlen > 0 { dlen.min(payload) } else { payload };
             let file = File::open(p).map_err(|e| format!("cannot open {}: {e}", p.display()))?;
             members.push(MemberState {
@@ -183,6 +213,11 @@ impl ImageSet {
             });
         }
         members.sort_by_key(|m| m.logical_start);
+        for pair in members.windows(2) {
+            if pair[0].logical_start.saturating_add(pair[0].data_length) != pair[1].logical_start {
+                debug_warn!("adi2raw: warn: image-set members have a gap or overlap before {}; first covering member used; verify member mapping", pair[1].path);
+            }
+        }
         if members.is_empty() {
             return Err("image set has no members".into());
         }
@@ -826,18 +861,25 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
         let comp = adi.read_logical(b.off, b.csize as usize)?;
         let data = match dec.decode(&comp) {
             Ok(d) if d.len() == b.usize as usize => d,
-            _ => continue,
+            _ => {
+                debug_warn!("adi2raw: warn: block at 0x{:x}: decode/size/layout failure during discovery; skipped; verify output", b.off);
+                continue;
+            }
         };
         if b.crc != 0 {
             out.crc_checked += 1;
             if !b.crc_ok(&data) {
                 out.crc_bad += 1;
+                debug_warn!("adi2raw: warn: block at 0x{:x}: checksum mismatch during discovery; skipped; verify output", b.off);
                 continue;
             }
         }
         let lay = match split_block(&data, b.usize, 0) {
             Some(l) if l.units != 0 && l.cluster >= 512 => l,
-            _ => continue,
+            _ => {
+                debug_warn!("adi2raw: warn: block at 0x{:x}: decode/size/layout failure during discovery; skipped; verify output", b.off);
+                continue;
+            }
         };
         let mut slot = 0usize;
         for u in 0..(REGION / lay.cluster as u64) as u32 {
@@ -847,6 +889,7 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
             let src = lay.hdr as usize + slot * lay.cluster as usize;
             slot += 1;
             if src + lay.cluster as usize > data.len() {
+                debug_warn!("adi2raw: warn: block at 0x{:x}: truncated cluster data during discovery; verify output", b.off);
                 break;
             }
             let cd = &data[src..src + lay.cluster as usize];
@@ -1042,11 +1085,15 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
             let comp = adi.read_logical(b.off, b.csize as usize)?;
             let data = dec.decode(&comp).unwrap_or_default();
             if data.len() != b.usize as usize || !b.crc_ok(&data) {
+                debug_warn!("adi2raw: warn: block at 0x{:x}: decode/size/checksum failure during volume probe; skipped; verify output", b.off);
                 continue;
             }
             let lay = match split_block(&data, b.usize, probe_cluster) {
                 Some(l) => l,
-                None => continue,
+                None => {
+                    debug_warn!("adi2raw: warn: block at 0x{:x}: unrecognised layout during volume probe; skipped; verify output", b.off);
+                    continue;
+                }
             };
             if probe_cluster == 0 && lay.hdr != 1 {
                 probe_cluster = lay.cluster;

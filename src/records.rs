@@ -348,6 +348,9 @@ fn read_vdb_table(adi: &mut Adi, r: &DataBlockRef, delta: i64) -> Result<Vec<Vdb
         r.data_size as usize,
         (r.entry_count as usize).saturating_mul(VDB_SIZE),
     );
+    if want != r.entry_count as usize * VDB_SIZE || want & (VDB_SIZE - 1) != 0 {
+        debug_warn!("adi2raw: warn: VDB reference at 0x{phys:x}: truncated/misaligned table length; entries may be skipped; verify completeness");
+    }
     let raw = adi.read_at(phys, want)?;
     let mut out = Vec::new();
     for p in (0..want).step_by(VDB_SIZE) {
@@ -378,6 +381,8 @@ fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
         if let Some((hh, raw)) = load_record(adi, h.off) {
             if let Some(idx) = parse_data_block_index(hh, &raw) {
                 data_blocks.push(idx);
+            } else {
+                debug_warn!("adi2raw: warn: malformed CRC-valid 0x202 at 0x{:x}; ignored; verify completeness", h.off);
             }
         }
     }
@@ -417,6 +422,10 @@ fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
             continue;
         };
         let Some(dir) = parse_directory_index(hh, &raw) else {
+            debug_warn!(
+                "adi2raw: warn: malformed CRC-valid 0x201 at 0x{:x}; ignored; verify completeness",
+                h.off
+            );
             continue;
         };
         let db_entries: Vec<DirEntry> = dir
@@ -426,9 +435,11 @@ fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
             .filter(|e| e.rec_type == TYPE_DATABLOCK_INDEX)
             .collect();
         if db_entries.len() != 1 {
+            debug_warn!("adi2raw: warn: volume index at 0x{:x}: expected one 0x202 reference, found {}; skipped; output needs verification", h.off, db_entries.len());
             continue;
         }
         let Some(matches) = by_payload_end.get(&db_entries[0].offset) else {
+            debug_warn!("adi2raw: warn: volume index at 0x{:x}: no matching 0x202; skipped; output needs verification", h.off);
             continue;
         };
         for &mi in matches {
@@ -466,14 +477,21 @@ fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
                     TYPE_VOLUME_METADATA => {
                         if let Some(m) = parse_metadata(rh, &rraw) {
                             metadata.push(m);
-                        }
+                        } else { debug_warn!("adi2raw: warn: malformed 0x102 at 0x{:x}; ignored; verify metadata", phys); }
                     }
-                    TYPE_COMPRESS => compress_mode = parse_mode(rh, &rraw),
-                    TYPE_ENCRYPT => encrypt_mode = parse_mode(rh, &rraw),
-                    _ => {}
+                    TYPE_COMPRESS => {
+                        compress_mode = parse_mode(rh, &rraw);
+                        if compress_mode.is_none() { debug_warn!("adi2raw: warn: malformed 0x105 at 0x{:x}; mode unknown; verify output", phys); }
+                    }
+                    TYPE_ENCRYPT => {
+                        encrypt_mode = parse_mode(rh, &rraw);
+                        if encrypt_mode.is_none() { debug_warn!("adi2raw: warn: malformed 0x106 at 0x{:x}; mode unknown; verify output", phys); }
+                    }
+                    _ => debug_warn!("adi2raw: warn: unknown referenced record type 0x{:x} at 0x{:x}; ignored; output needs verification", e.rec_type, phys)
                 }
             }
             if !ok || regions.is_empty() {
+                debug_warn!("adi2raw: warn: volume index at 0x{:x}: invalid, unreadable or checksum-invalid referenced record, or missing regions; candidate skipped; output needs verification", h.off);
                 continue;
             }
             let mut entries = Vec::new();
@@ -487,7 +505,16 @@ fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
                 }
             }
             if !ok || entries.is_empty() {
+                debug_warn!("adi2raw: warn: volume index at 0x{:x}: invalid or empty VDB table; candidate skipped; output needs verification", h.off);
                 continue;
+            }
+            if compress_mode.is_none() && global_compress.is_some()
+                || encrypt_mode.is_none() && global_encrypt.is_some()
+            {
+                debug_warn!("adi2raw: warn: volume index at 0x{:x}: mode taken from an unassociated global record; verify applicability", h.off);
+            }
+            if entries.len() != dbi.entry_count as usize {
+                debug_warn!("adi2raw: warn: volume index at 0x{:x}: VDB count differs from declared count/capacity; verify completeness", h.off);
             }
             sets.push(RecordSet {
                 volume_index_off: dir.off,
@@ -522,23 +549,55 @@ pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
     for set in &sets {
         compress_mode = compress_mode.or(set.compress_mode);
         encrypt_mode = encrypt_mode.or(set.encrypt_mode);
+        if set.compress_mode.is_some_and(|m| m > 1) || set.encrypt_mode.is_some_and(|m| m != 0) {
+            debug_warn!("adi2raw: warn: unsupported compression/encryption mode; extraction is not verified/supported for this set");
+        }
         let meta = set.metadata.first();
+        if set.metadata.len() != 1 {
+            debug_warn!("adi2raw: warn: volume index at 0x{:x}: {} metadata records; using first or default LBA 0/512-byte sectors; verify placement", set.volume_index_off, set.metadata.len());
+        }
+        if meta.is_some_and(|m| !(512..=4096).contains(&m.bytes_per_sector)) {
+            debug_warn!(
+                "adi2raw: warn: invalid metadata sector size; assuming 512 bytes; verify placement"
+            );
+        }
+        if set.compress_mode.is_none() || set.encrypt_mode.is_none() {
+            debug_warn!("adi2raw: warn: volume index at 0x{:x}: missing compression/encryption mode; assuming LZ4 for compressed blocks and no encryption; verify output", set.volume_index_off);
+        }
+        if compress_mode
+            .zip(set.compress_mode)
+            .is_some_and(|(a, b)| a != b)
+            || encrypt_mode
+                .zip(set.encrypt_mode)
+                .is_some_and(|(a, b)| a != b)
+        {
+            debug_warn!("adi2raw: warn: conflicting volume modes; first mode retained; output needs verification");
+        }
         let bps = meta
             .map(|m| m.bytes_per_sector)
             .filter(|&b| (512..=4096).contains(&b))
             .unwrap_or(512) as u64;
+        if bps != 512 {
+            debug_warn!("adi2raw: warn: non-512-byte metadata sectors with 512-byte output GPT addressing; layout needs further verification");
+        }
         let part_start = meta.map(|m| m.partition_start_sector).unwrap_or(0);
         let part_sectors = meta.map(|m| m.partition_total_sectors).unwrap_or(0);
         let label = meta.map(|m| m.label.clone()).unwrap_or_default();
         let description = meta.map(|m| m.description.clone()).unwrap_or_default();
         let type_guid = meta.map(|m| m.type_guid).unwrap_or([0; 16]);
         let unique_guid = meta.map(|m| m.unique_guid).unwrap_or([0; 16]);
+        if type_guid == [0; 16] || unique_guid == [0; 16] {
+            debug_warn!("adi2raw: warn: missing partition GUIDs; GPT uses a label-inferred type and/or generated identity; verify partition metadata");
+        }
         let region_end: u64 = set
             .regions
             .iter()
             .map(|r| r.block_begin_sector + r.total_sectors)
             .max()
             .unwrap_or(0);
+        if part_sectors < region_end {
+            debug_warn!("adi2raw: warn: partition length absent/shorter than region extent; expanding from region geometry; verify partition bounds");
+        }
         let sectors = part_sectors.max(region_end).max(1);
         let cluster = set
             .regions
@@ -554,14 +613,27 @@ pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
         let mut count = 0usize;
         let mut region_map: BTreeMap<u32, Region> = BTreeMap::new();
         for r in &set.regions {
-            region_map.insert(r.reg_no, *r);
+            if region_map.insert(r.reg_no, *r).is_some() {
+                debug_warn!(
+                    "adi2raw: warn: duplicate region {}; last geometry retained; verify output",
+                    r.reg_no
+                );
+            }
+            if r.bytes_per_sector as u64 != bps {
+                debug_warn!(
+                    "adi2raw: warn: region {} and metadata sector sizes differ; verify placement",
+                    r.reg_no
+                );
+            }
         }
         for e in &set.entries {
             let Some(r) = region_map.get(&e.reg_no) else {
+                debug_warn!("adi2raw: warn: VDB entry at logical 0x{:x}, region {}: missing region or invalid sizes; skipped; output needs verification", e.img_offset, e.reg_no);
                 skipped_regions += 1;
                 continue;
             };
             if e.old_size < r.bitmap_len() || e.new_size == 0 {
+                debug_warn!("adi2raw: warn: VDB entry at logical 0x{:x}, region {}: missing region or invalid sizes; skipped; output needs verification", e.img_offset, e.reg_no);
                 skipped_regions += 1;
                 continue;
             }
@@ -598,10 +670,24 @@ pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
         });
     }
 
+    let unchecked = blocks.iter().filter(|b| b.crc == 0).count();
+    if unchecked != 0 {
+        debug_warn!("adi2raw: warn: {unchecked} VDB blocks have no decoded checksum; contents need verification");
+    }
     if blocks.is_empty() {
         return Ok(None);
     }
     blocks.sort_by_key(|b| (b.base, b.off));
+    let mut covered_end = 0;
+    for b in &blocks {
+        if b.base < covered_end {
+            debug_warn!("adi2raw: warn: overlapping VDB block extents at output 0x{:x}; write precedence needs verification", b.base);
+        }
+        let span = b
+            .region_remaining
+            .min(b.clusters_per_block as u64 * b.cluster as u64);
+        covered_end = covered_end.max(b.base.saturating_add(span));
+    }
     let mut end_sectors = volumes
         .iter()
         .map(|v| v.lba.saturating_add(v.sectors))

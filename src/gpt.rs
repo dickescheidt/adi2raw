@@ -55,9 +55,18 @@ fn part_type(v: &Volume, last: bool) -> (&'static [u8; 16], &'static str) {
 }
 
 fn entries(volumes: &[Volume]) -> Vec<u8> {
+    if volumes.len() > 128 {
+        debug_warn!("adi2raw: warn: GPT has only 128 entries; excess volumes omitted from partition table; verify output");
+    }
     let mut ents = vec![0u8; 128 * 128];
     let mut n = 0usize;
     for (i, v) in volumes.iter().enumerate() {
+        if v.type_guid == [0; 16] || v.unique_guid == [0; 16] {
+            debug_warn!("adi2raw: warn: volume {i}: missing partition GUIDs; generated/inferred GPT metadata needs verification");
+        }
+        if v.sectors == 0 {
+            debug_warn!("adi2raw: warn: volume {i}: zero sectors; omitted from GPT; verify output");
+        }
         if v.sectors == 0 || n >= 128 {
             continue;
         }

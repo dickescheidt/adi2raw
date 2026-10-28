@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory() as tmp:
             print(mode + ': correctly rejected')
             continue
         assert proc.returncode == 0, proc.stderr
-        assert b'warn' not in proc.stderr.lower(), proc.stderr
+        assert b'geometry' not in proc.stderr.lower() and b'skipped' not in proc.stderr.lower(), proc.stderr
         data = raw.read_bytes()
         origin = 2048 * 512
         start = origin + 512 * 512

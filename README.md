@@ -260,6 +260,37 @@ signal 13 / exit 141), that is the single change that would require an
 
 ---
 
+## Debug diagnostics and verification
+
+Use `--debug` to enable extended format-audit diagnostics on **stderr**:
+
+```bash
+adi2raw --debug info backup.adi
+adi2raw --debug dump backup.adi > disk.img 2> debug.log
+```
+
+The flag can appear before or after the command. Use `--` to end option parsing
+if a filename is literally `--debug`. Existing corruption/skip warnings and fatal
+errors remain visible without the flag. Debug mode changes diagnostics only,
+not the recovered bytes or exit status.
+
+Extended diagnostics cover unknown referenced records, rejected record-set
+candidates, missing or ambiguous metadata/modes, absent/unverified checksums,
+image-set gaps/overlaps, and inferred geometry or partition metadata. They also
+explain that `info` does not decode and verify all payload blocks. Correctly
+bounded partial final blocks are supported, not a geometry warning.
+
+A zero exit status is not proof of a complete or exact restore. Review recovery
+warnings; do not use partial output left by a failed command. This is a
+reverse-engineered format: diagnostics cover detected uncertainty, not unknown
+semantics the parser cannot recognize. Arbitrary signature-like bytes in
+compressed payloads are not treated as records, so rejected scan candidates
+alone do not trigger diagnostics.
+
+Validate the recovered layout and filesystem independently before restoring
+valuable media. Decoded block checksums do not verify destination placement or
+prove that a reconstructed GPT is identical to the original partition table.
+
 ## Limitations
 
 Same constraints as the tool it is based on, plus streaming-specific ones:
