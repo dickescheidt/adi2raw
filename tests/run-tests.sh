@@ -4,6 +4,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+cargo test --quiet
 cargo build --release
 BIN="$PWD/target/release/adi2raw"
 TMP="$(mktemp -d)"
@@ -11,6 +12,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 python3 tests/make_test_adi.py "$TMP/simple.adi" simple
 python3 tests/make_test_adi.py "$TMP/multi.adi" multi
+python3 tests/make_test_adi.py "$TMP/bigcluster.adi" bigcluster
+python3 tests/make_test_adi.py "$TMP/badcrc.adi" simple-badcrc
 python3 tests/make_multipart_adi.py "$TMP/multipart.adi"
 python3 tests/make_out_of_order_adi.py "$TMP/ooo.adi"
 python3 tests/make_gap_regions_adi.py "$TMP/gaps.adi"
@@ -41,12 +44,32 @@ grep -q "layout: whole-disk stream" "$TMP/multipart.err"
 python3 tests/check_multipart.py "$TMP/multipart.img" 4736512
 echo "multipart: OK"
 
-echo "== diagnostics: an ordered index can be scrambled by resolve_regions =="
+echo "== ordered index with chain gaps must stay ordered =="
 "$BIN" info "$TMP/simple.adi" | grep -q "out-of-order steps: 0"
 "$BIN" info "$TMP/gaps.adi" > "$TMP/gaps.info" 2> /dev/null
-grep -q "index regions monotone: raw yes, after resolve_regions no" "$TMP/gaps.info"
-grep -Eq "estimated reorder need: [1-9][0-9]* MiB" "$TMP/gaps.info"
+grep -q "index regions monotone: raw yes, after resolve_regions yes" "$TMP/gaps.info"
+grep -q "estimated reorder need: 0 MiB" "$TMP/gaps.info"
 echo "regions diagnostic: OK"
+
+echo "== CRC32C (BRCrc32) on decoded blocks =="
+"$BIN" info "$TMP/simple.adi" > "$TMP/crc.info"
+grep -q "2 records carry a BRCrc32 checksum" "$TMP/crc.info"
+grep -q "verified:  2 decoded blocks checked, 0 mismatches, 0 unchecked" "$TMP/crc.info"
+
+# A deliberately wrong checksum must be reported, and only that block skipped.
+"$BIN" info "$TMP/badcrc.adi" > "$TMP/badcrc.info" 2> /dev/null
+grep -q "verified:  2 decoded blocks checked, 1 mismatches, 0 unchecked" "$TMP/badcrc.info"
+"$BIN" dump "$TMP/badcrc.adi" > "$TMP/badcrc.img" 2> "$TMP/badcrc.err"
+grep -q "CRC32C mismatch" "$TMP/badcrc.err"
+grep -q "1 block(s) failed CRC32C verification" "$TMP/badcrc.err"
+python3 tests/check_raw.py "$TMP/badcrc.img" 3163648 1310720=0
+echo "crc32c: OK"
+
+echo "== 32 KiB clusters with a 1-byte sparse bitmap =="
+"$BIN" dump "$TMP/bigcluster.adi" > "$TMP/bigcluster.img" 2> "$TMP/bigcluster.err"
+! grep -q "unrecognised layout" "$TMP/bigcluster.err"
+python3 tests/check_bigcluster.py "$TMP/bigcluster.img" 3163648
+echo "big clusters: OK"
 
 echo "== out-of-order blocks: sparse spool fallback =="
 # A large cap keeps everything in RAM; a 1 MiB cap forces the spool path.
@@ -85,9 +108,10 @@ if [[ -n "${ADI_EXTRACT:-}" && -x "$ADI_EXTRACT" ]]; then
     echo "== reference comparison (C++ adi-extract) =="
     # The multipart comparison needs a C++ build with the whole-disk
     # boot-sector scan (the POSIX fork at dickescheidt/adi-extract).
-    for kind in simple multi multipart ooo; do
-        "$ADI_EXTRACT" reconstruct "$TMP/$kind.adi" "$TMP/cpp-$kind.img" > /dev/null 2>&1
-        rm -f "$TMP/$kind.adi.index"
+    for kind in simple multi multipart bigcluster ooo; do
+        src="$TMP/$kind.adi"
+        "$ADI_EXTRACT" reconstruct "$src" "$TMP/cpp-$kind.img" > /dev/null 2>&1
+        rm -f "$src.index"
         cmp "$TMP/cpp-$kind.img" "$TMP/$kind.img"
         echo "$kind: byte-identical to C++ output"
     done

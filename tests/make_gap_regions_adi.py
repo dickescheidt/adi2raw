@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Synthetic .adi with a perfectly ordered index that resolve_regions() mangles.
+"""Regression fixture: an ordered index with chain gaps must stay ordered.
 
 Six compressed blocks in three chain runs, separated by metadata gaps. The
 raw region fields in the index records are strictly increasing (100000..100005)
--- i.e. the file is in perfect disk order. But resolve_regions() forces every
-run head to the lowest unused region (0) and shifts the other values, producing
-resolved regions like [0, 100000, 0, 100002, 0, 100004]. The resulting target
-offsets oscillate by tens of GiB even though nothing in the .adi is scrambled.
+-- i.e. the file is in perfect disk order.
 
-This is a diagnostic fixture: `adi2raw info` on it must report
-"raw yes, after resolve_regions no". Do not dump it (the disk is huge).
+An older resolve_regions() split the chain at those gaps and forced every run
+head to the "lowest unused" region (0), producing resolved regions like
+[0, 100000, 0, 100002, 0, 100004]. The target offsets then oscillated by tens
+of GiB and adi2raw reported "image blocks are too far out of disk order to
+stream" even though nothing in the .adi was scrambled. The fix is one global
+one-record shift, so `adi2raw info` must now report
+"raw yes, after resolve_regions yes" and a 0 MiB reorder need.
+
+This is a diagnostic fixture. Do not dump it (the disk is huge).
 
 Usage: python3 make_gap_regions_adi.py OUTPUT.adi
 """
 import struct
 import sys
+
+from adi_fixture import br_crc32, lz4_literals, record
 
 REGION = 256 * 1024
 CLUSTER = 512
@@ -42,31 +48,15 @@ def block(cluster_bytes: bytes) -> bytes:
     return bytes(bitmap) + cluster_bytes
 
 
-def lz4_literals(data: bytes) -> bytes:
-    n = len(data)
-    out = bytearray([min(n, 15) << 4])
-    left = n - min(n, 15)
-    if n >= 15:
-        while left >= 255:
-            out.append(255)
-            left -= 255
-        out.append(left)
-    out += data
-    return bytes(out)
-
-
-def record(off, usize, csize, raw_region) -> bytes:
-    return struct.pack("<QIIIIII", off, usize, csize, 0, 0, raw_region, 0)
-
-
 def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else "gap-regions.adi"
 
     raw_regions = [100000 + i for i in range(6)]
-    comps = [
-        lz4_literals(block(boot_sector() if i == 0 else bytes([0xC3]) * CLUSTER))
+    decoded_blocks = [
+        block(boot_sector() if i == 0 else bytes([0xC3]) * CLUSTER)
         for i in range(6)
     ]
+    comps = [lz4_literals(d) for d in decoded_blocks]
 
     # Three runs of two blocks; 128 bytes of padding between runs creates a
     # gap in the compressed chain (end of one block != start of the next).
@@ -80,7 +70,9 @@ def main() -> None:
 
     index = bytearray()
     for i, (off, comp) in enumerate(zip(offs, comps)):
-        index += record(off, HDR + CLUSTER, len(comp), raw_regions[i])
+        checksum = br_crc32(decoded_blocks[i])
+        index += record(off, len(decoded_blocks[i]), len(comp), 0,
+                        raw_regions[i], checksum)
     payload += index
     payload += bytes(256)
 

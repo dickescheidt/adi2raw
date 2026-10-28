@@ -6,26 +6,17 @@ format reader cares about: BIFH/BIFT framing, a signature-scanned block index,
 LZ4 literal blocks, used-sector bitmaps, multiple volumes, two cluster sizes,
 sparse units and out-of-order regions.
 
-Usage: python3 make_test_adi.py OUTPUT.adi [simple|multi]
+Every index record carries a real AOMEI BRCrc32 (CRC32C) over its decoded
+block, so the tests also verify the checksum path end to end.
+
+Usage: python3 make_test_adi.py OUTPUT.adi [simple|multi|bigcluster|simple-badcrc]
 """
 import struct
 import sys
 
+from adi_fixture import br_crc32, lz4_literals, record
+
 REGION = 256 * 1024
-
-
-def lz4_literals(data: bytes) -> bytes:
-    """One LZ4 literal run in the dialect used inside .adi blocks."""
-    n = len(data)
-    out = bytearray([min(n, 15) << 4])
-    left = n - min(n, 15)
-    if n >= 15:
-        while left >= 255:
-            out.append(255)
-            left -= 255
-        out.append(left)
-    out += data
-    return bytes(out)
 
 
 def boot_sector(hidden: int, total: int, spc: int) -> bytes:
@@ -54,27 +45,25 @@ def make_block(cluster: int, present: dict[int, bytes]) -> bytes:
     return bytes(bitmap) + bytes(body)
 
 
-def record(off, usize, csize, stream, region) -> bytes:
-    return struct.pack("<QIIIIII", off, usize, csize, 0, stream, region, 0)
-
-
-def build(recipes) -> bytes:
+def build(recipes, bad_crc_index: int | None = None) -> bytes:
     """recipes: list of (cluster, {unit: bytes}, raw_region, gap_before)."""
     payload = bytearray()
     recs = []
     for cluster, units, raw_region, gap_before in recipes:
         payload += bytes(gap_before)
-        data = lz4_literals(make_block(cluster, units))
+        decoded = make_block(cluster, units)
+        data = lz4_literals(decoded)
         off = len(payload)
         payload += data
-        recs.append([off, len(data), raw_region])
+        recs.append((off, len(data), len(decoded), raw_region, br_crc32(decoded)))
 
     # Index records sit physically adjacent. Adjacent pairs must chain via
     # end()==off; a gap in off creates a new volume (a new index run).
     index = bytearray()
-    for i, (off, csize, raw_region) in enumerate(recs):
-        usize = REGION // recipes[i][0] // 8 + len(recipes[i][1]) * recipes[i][0]
-        index += record(off, usize, csize, 0, raw_region)
+    for i, (off, csize, usize, raw_region, checksum) in enumerate(recs):
+        if bad_crc_index is not None and i == bad_crc_index:
+            checksum = 0xDEADBEEF
+        index += record(off, usize, csize, 0, raw_region, checksum)
     payload += index
     payload += bytes(256)  # keep the index out of the scanner's 64-byte tail
 
@@ -85,14 +74,14 @@ def build(recipes) -> bytes:
     return bytes(header) + bytes(payload) + footer
 
 
-def simple() -> bytes:
+def simple(bad_crc: bool = False) -> bytes:
     """One NTFS volume, 512-byte clusters, two regions."""
     c = 512
     bs = boot_sector(2048, 4096, 1)
     return build([
         (c, {0: bs}, 1, 0),
         (c, {0: bytes([0xC3]) * c}, 0, 0),
-    ])
+    ], bad_crc_index=1 if bad_crc else None)
 
 
 def multi() -> bytes:
@@ -113,10 +102,35 @@ def multi() -> bytes:
     ])
 
 
+def bigcluster() -> bytes:
+    """32 KiB clusters, as real AOMEI C: regions use (2 MiB / 64 SPC).
+
+    The used-sector bitmap is a single byte, and some of its bits are clear:
+    the reader must honour the bits rather than treat hdr==1 as "all present".
+    """
+    c = 32768
+    bs = boot_sector(2048, 4096, 64)
+    return build([
+        (c, {
+            0: bs,
+            1: bytes([0xA1]) * c,
+            3: bytes([0xA3]) * c,
+            6: bytes([0xA6]) * c,
+        }, 1, 0),
+        (c, {0: bytes([0xB0]) * c, 7: bytes([0xB7]) * c}, 0, 0),
+    ])
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "test.adi"
     kind = sys.argv[2] if len(sys.argv) > 2 else "multi"
-    data = {"simple": simple, "multi": multi}[kind]()
+    kinds = {
+        "simple": simple,
+        "multi": multi,
+        "bigcluster": bigcluster,
+        "simple-badcrc": lambda: simple(bad_crc=True),
+    }
+    data = kinds[kind]()
     with open(path, "wb") as f:
         f.write(data)
     print(f"wrote {path} ({len(data)} bytes, {kind})")

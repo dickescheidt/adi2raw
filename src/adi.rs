@@ -287,6 +287,13 @@ impl BlockRec {
     pub fn end(&self) -> u64 {
         self.off + self.csize as u64
     }
+
+    /// `crc` is `Encrypt.dll!BRCrc32` over the *decoded* `usize` bytes. A zero
+    /// field means the writer left no checksum (our own fixtures do this); we
+    /// cannot distinguish that from a real zero CRC, so skip those records.
+    pub fn crc_ok(&self, data: &[u8]) -> bool {
+        self.crc == 0 || crate::crc::br_crc32(data) == self.crc
+    }
 }
 
 fn parse_rec(p: &[u8]) -> BlockRec {
@@ -373,43 +380,28 @@ pub fn scan_block_index(adi: &mut Adi) -> Result<Vec<BlockRec>> {
     Ok(out)
 }
 
+/// The 32-byte window we find by signature is a real VDB index entry read 12
+/// bytes late: its `RegNo`/`BlockNo` fields describe the *next* block, not the
+/// one at `off`. So block i's region/stream is the stored value from record
+/// i-1, and the very first block has no predecessor.
+///
+/// The old code split the chain at gaps and then invented the "lowest free"
+/// region number for every run head. On a real multi-volume image those heads
+/// start at high block numbers, so inventing 0 made the resolved region list
+/// jump backwards by gigabytes — which is what produced the bogus
+/// "image blocks are too far out of disk order to stream" error. A single
+/// global shift has no such discontinuity.
 fn resolve_regions(blocks: &mut [BlockRec]) {
-    let n = blocks.len();
     let raw_stream: Vec<u32> = blocks.iter().map(|b| b.stream).collect();
     let raw_region: Vec<u32> = blocks.iter().map(|b| b.region).collect();
-    let mut run_of = vec![0usize; n];
-    let mut run = 0usize;
-    for i in 0..n {
-        if i > 0 && blocks[i - 1].end() != blocks[i].off {
-            run += 1;
+    for (i, b) in blocks.iter_mut().enumerate() {
+        if i == 0 {
+            b.stream = 0;
+            b.region = 0;
+        } else {
+            b.stream = raw_stream[i - 1];
+            b.region = raw_region[i - 1];
         }
-        run_of[i] = run;
-    }
-    let mut groups: BTreeMap<(usize, u32), Vec<usize>> = BTreeMap::new();
-    for i in 0..n {
-        let opens_run = i == 0 || run_of[i - 1] != run_of[i];
-        blocks[i].stream = if opens_run { 0 } else { raw_stream[i - 1] };
-        blocks[i].region = if opens_run { 0 } else { raw_region[i - 1] };
-        groups
-            .entry((run_of[i], blocks[i].stream))
-            .or_default()
-            .push(i);
-    }
-    for ((_, _), idxs) in groups {
-        let head = idxs[0];
-        let opens_run = head == 0 || run_of[head - 1] != run_of[head];
-        let mut taken = BTreeSet::new();
-        for k in if opens_run { 1 } else { 0 }..idxs.len() {
-            taken.insert(blocks[idxs[k]].region);
-        }
-        if !opens_run {
-            continue;
-        }
-        let mut free = 0u32;
-        while taken.contains(&free) {
-            free += 1;
-        }
-        blocks[head].region = free;
     }
 }
 
@@ -422,6 +414,10 @@ pub struct Layout {
     pub hdr: u32,
     pub cluster: u32,
     pub units: u32,
+    /// `usize == 1 + REGION`: the bitmap is a single "all present" marker byte,
+    /// not a real 1-byte bitmap. A genuine 1-byte bitmap (32 KiB clusters or a
+    /// 0x109 `ClusPerBlock` of 8) must still be read bit by bit.
+    pub all_present: bool,
 }
 
 /// A decompressed block is a used-sector bitmap followed by only the clusters
@@ -436,22 +432,33 @@ pub fn split_block(data: &[u8], usize_: u32, hint: u32) -> Option<Layout> {
             hdr: 1,
             cluster,
             units: (REGION / cluster as u64) as u32,
+            all_present: true,
         });
     }
-    for cluster in [512u32, 1024, 2048, 4096, 8192, 16384] {
+    // Real images use 32 KiB clusters for sparse C: regions (2 MiB / 64
+    // sectors per cluster). Cover the whole power-of-two range up to 64 KiB so
+    // a 0x109 geometry hint of 32768 or 65536 is never silently dropped.
+    for cluster in [512u32, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
         if hint != 0 && cluster != hint {
             continue;
         }
-        let hdr = (REGION / cluster as u64 / 8) as usize;
-        if hdr > data.len() {
+        let clusters_per_region = REGION / cluster as u64;
+        let hdr = clusters_per_region.div_ceil(8) as usize;
+        if hdr == 0 || hdr > data.len() {
             continue;
         }
-        let pop: u32 = data[..hdr].iter().map(|b| b.count_ones()).sum();
+        let mut pop: u32 = data[..hdr].iter().map(|b| b.count_ones()).sum();
+        let spare_bits = (hdr as u64 * 8 - clusters_per_region).min(7);
+        if spare_bits > 0 {
+            let last = data[hdr - 1] & (0xffu8 >> spare_bits);
+            pop = pop - data[hdr - 1].count_ones() + last.count_ones();
+        }
         if usize_ == hdr as u32 + pop * cluster {
             return Some(Layout {
                 hdr: hdr as u32,
                 cluster,
                 units: pop,
+                all_present: false,
             });
         }
     }
@@ -459,7 +466,7 @@ pub fn split_block(data: &[u8], usize_: u32, hint: u32) -> Option<Layout> {
 }
 
 pub fn unit_present(data: &[u8], lay: &Layout, u: u32) -> bool {
-    if lay.hdr == 1 {
+    if lay.all_present {
         return true;
     }
     let idx = (u >> 3) as usize;
@@ -584,6 +591,8 @@ pub struct BootHit {
 struct BootScan {
     hits: Vec<BootHit>,
     region0_has_mbr: bool,
+    crc_checked: u64,
+    crc_bad: u64,
 }
 
 /// AOMEI normally writes a multi-partition disk as one contiguous block chain.
@@ -594,6 +603,8 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
     let mut out = BootScan {
         hits: Vec::new(),
         region0_has_mbr: false,
+        crc_checked: 0,
+        crc_bad: 0,
     };
     let mut dec = Lz4::new();
     let mut seen = BTreeSet::new();
@@ -606,6 +617,13 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
             Ok(d) if d.len() == b.usize as usize => d,
             _ => continue,
         };
+        if b.crc != 0 {
+            out.crc_checked += 1;
+            if !b.crc_ok(&data) {
+                out.crc_bad += 1;
+                continue;
+            }
+        }
         let lay = match split_block(&data, b.usize, 0) {
             Some(l) if l.units != 0 && l.cluster >= 512 => l,
             _ => continue,
@@ -657,6 +675,9 @@ pub struct SectorMap {
     pub origin: u64,
     /// The stream already carries an MBR/GPT at LBA 0; do not synthesise one.
     pub native_table: bool,
+    /// Blocks whose VDB entry carried a CRC32C that was checked while mapping.
+    pub crc_checked: u64,
+    pub crc_bad: u64,
 }
 
 fn volume_ranges(blocks: &[BlockRec]) -> Vec<(usize, usize)> {
@@ -762,6 +783,8 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
             passthrough: true,
             origin,
             native_table,
+            crc_checked: scan.crc_checked,
+            crc_bad: scan.crc_bad,
         });
     }
 
@@ -801,6 +824,9 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
         for b in &blocks[first..stop] {
             let comp = adi.read_at(adi.payload_offset() + b.off, b.csize as usize)?;
             let data = dec.decode(&comp).unwrap_or_default();
+            if data.len() != b.usize as usize || !b.crc_ok(&data) {
+                continue;
+            }
             let lay = match split_block(&data, b.usize, probe_cluster) {
                 Some(l) => l,
                 None => continue,
@@ -863,10 +889,62 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
         passthrough: false,
         origin: 0,
         native_table: false,
+        crc_checked: scan.crc_checked,
+        crc_bad: scan.crc_bad,
     })
 }
 
 /// Where a block's units land, mirroring `reconstruct_image()` in image.cpp.
 pub fn block_base(vol: &Volume, b: &BlockRec) -> u64 {
     vol.lba * SECTOR + if b.stream == 0 { vol.data_base } else { 0 } + b.region as u64 * REGION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_regions_is_one_global_shift() {
+        // Three chain runs of two blocks, raw regions strictly increasing.
+        // The old "lowest free region at each run head" logic produced
+        // [0, 100000, 0, 100002, 0, 100004] from this perfectly ordered index.
+        let mut blocks: Vec<BlockRec> = (0..6)
+            .map(|i| BlockRec {
+                off: 4096 * i + (i / 2) * 128,
+                usize: 4096,
+                csize: 4096,
+                crc: 0,
+                stream: 0,
+                region: 100_000 + i as u32,
+                raw_region: 100_000 + i as u32,
+            })
+            .collect();
+        resolve_regions(&mut blocks);
+        assert_eq!(blocks[0].region, 0);
+        for i in 1..blocks.len() {
+            assert_eq!(blocks[i].region, 100_000 + (i - 1) as u32);
+            assert!(blocks[i].region > blocks[i - 1].region);
+        }
+    }
+
+    #[test]
+    fn split_block_handles_32k_sparse_bitmap() {
+        let mut data = vec![0x5Au8; 1 + 3 * 32768];
+        data[0] = 0x49; // bits 0, 3, 6
+        let lay = split_block(&data, data.len() as u32, 32768).unwrap();
+        assert_eq!((lay.hdr, lay.cluster, lay.units), (1, 32768, 3));
+        assert!(!lay.all_present);
+        assert!(unit_present(&data, &lay, 0));
+        assert!(!unit_present(&data, &lay, 1));
+        assert!(unit_present(&data, &lay, 3));
+        assert!(unit_present(&data, &lay, 6));
+        assert!(!unit_present(&data, &lay, 7));
+
+        // The all-present shorthand is a different case, not a real bitmap.
+        let mut all = vec![0x11u8; 1 + REGION as usize];
+        all[0] = 1;
+        let lay = split_block(&all, all.len() as u32, 0).unwrap();
+        assert!(lay.all_present);
+        assert!(unit_present(&all, &lay, 7));
+    }
 }

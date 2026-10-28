@@ -14,6 +14,8 @@ Usage: python3 tests/make_multipart_adi.py multipart.adi
 import struct
 import sys
 
+from adi_fixture import br_crc32, lz4_literals, record
+
 CLUSTER = 512
 UNITS = 262144 // CLUSTER
 HDR = UNITS // 8
@@ -61,42 +63,26 @@ def block(payload: bytes) -> bytes:
     return bytes(bitmap) + payload
 
 
-def lz4_literals(data: bytes) -> bytes:
-    n = len(data)
-    out = bytearray([min(n, 15) << 4])
-    left = n - min(n, 15)
-    if n >= 15:
-        while left >= 255:
-            out.append(255)
-            left -= 255
-        out.append(left)
-    out += data
-    return bytes(out)
-
-
-def record(off, usize, csize, stream, region) -> bytes:
-    return struct.pack("<QIIIIII", off, usize, csize, 0, stream, region, 0)
-
-
 def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else "multipart.adi"
 
     payload = bytearray()
     recs = []
     for region, kind in BLOCKS:
-        comp = lz4_literals(block(cluster(region, kind)))
+        decoded = block(cluster(region, kind))
+        comp = lz4_literals(decoded)
         off = len(payload)
         payload += comp
-        recs.append((off, len(comp), HDR + CLUSTER))
+        recs.append((off, len(comp), len(decoded), br_crc32(decoded)))
 
-    # resolve_regions() shifts record i's raw region onto block i+1 and
-    # recomputes block 0's region as the lowest unused value. Choose raw
-    # values so the final regions are exactly the ones in BLOCKS.
+    # A VDB entry's BlockNo describes the next block, so resolve_regions()
+    # shifts record i-1's region onto block i and sets block 0 to 0. Choose
+    # raw values so the final regions are exactly the ones in BLOCKS.
     final = [r for r, _ in BLOCKS]
     raw = final[1:] + [0]
     index = bytearray()
-    for i, (off, csize, usize) in enumerate(recs):
-        index += record(off, usize, csize, 0, raw[i])
+    for i, (off, csize, usize, checksum) in enumerate(recs):
+        index += record(off, usize, csize, 0, raw[i], checksum)
 
     payload += index
     payload += bytes(256)      # keep the index out of the scanner's 64-byte tail

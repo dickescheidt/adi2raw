@@ -4,6 +4,7 @@
 //!   adi2raw dump <file.adi>     write a raw disk image to stdout
 
 mod adi;
+mod crc;
 mod gpt;
 mod lz4;
 
@@ -342,6 +343,7 @@ fn block_writes(
     base: u64,
     limit: u64,
     cluster_hint: u32,
+    crc_bad: &mut u64,
 ) -> Result<Vec<(u64, Vec<u8>)>, String> {
     let comp = adi.read_at(adi.payload_offset() + b.off, b.csize as usize)?;
     let data = match dec.decode(&comp) {
@@ -357,6 +359,16 @@ fn block_writes(
             b.off,
             data.len(),
             b.usize
+        );
+        return Ok(Vec::new());
+    }
+    if !b.crc_ok(&data) {
+        *crc_bad += 1;
+        eprintln!(
+            "adi2raw: warn: block at 0x{:x}: CRC32C mismatch (got 0x{:08x}, expected 0x{:08x}) — skipped",
+            b.off,
+            crc::br_crc32(&data),
+            b.crc
         );
         return Ok(Vec::new());
     }
@@ -486,10 +498,16 @@ fn cmd_info(path: &Path) -> Result<(), String> {
     adi.print_info();
     println!("\n[block index]");
     println!("  records:   {}", blocks.len());
-    println!(
-        "  crcs:      {} records carry a checksum",
-        blocks.iter().filter(|b| b.crc != 0).count()
-    );
+    let crcs = blocks.iter().filter(|b| b.crc != 0).count();
+    println!("  crcs:      {} records carry a BRCrc32 checksum", crcs);
+    if crcs != 0 {
+        println!(
+            "  verified:  {} decoded blocks checked, {} mismatches, {} unchecked",
+            map.crc_checked,
+            map.crc_bad,
+            crcs.saturating_sub(map.crc_checked as usize)
+        );
+    }
     if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
         println!("  first off: 0x{:x}", first.off);
         println!("  last end:  0x{:x}", last.end());
@@ -609,6 +627,7 @@ fn cmd_dump(path: &Path) -> Result<(), String> {
     st.add(suffix_at, suffix)?;
 
     let mut dec = Lz4::new();
+    let mut crc_bad = 0u64;
     for (pi, entry) in plan.iter().enumerate() {
         let b = &blocks[entry.bi];
         // A gap in the compressed block chain starts a new LZ4 window.
@@ -622,6 +641,7 @@ fn cmd_dump(path: &Path) -> Result<(), String> {
             entry.base,
             disk_size,
             entry.cluster_hint,
+            &mut crc_bad,
         )?;
         for (dst, bytes) in writes {
             st.add(dst, bytes)?;
@@ -634,6 +654,12 @@ fn cmd_dump(path: &Path) -> Result<(), String> {
 
     st.finish(disk_size)?;
 
+    if crc_bad != 0 {
+        eprintln!(
+            "adi2raw: warn: {} block(s) failed CRC32C verification and were skipped",
+            crc_bad
+        );
+    }
     if st.broken {
         eprintln!("adi2raw: output pipe closed early");
     } else if st.total != disk_size {

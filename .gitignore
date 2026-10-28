@@ -7,3 +7,7 @@
 map.csv
 report.txt
 scan.txt
+
+# Python fixture bytecode
+__pycache__/
+*.pyc

@@ -51,7 +51,8 @@ size:     14720 bytes (0.00 GiB)
   ...
 [block index]
   records:   5
-  crcs:      0 records carry a checksum
+  crcs:      5 records carry a BRCrc32 checksum
+  verified:  5 decoded blocks checked, 0 mismatches, 0 unchecked
   first off: 0x0
   last end:  0x3790
 
@@ -71,6 +72,20 @@ size:     14720 bytes (0.00 GiB)
 `info` tells you the exact size of the stream, the volumes that will be
 reconstructed, and whether blocks are already in disk order. It does not modify
 anything.
+
+### Block checksums
+
+Each 0x20-byte VDB index entry ends with a `BRCrc32` over the block's
+**decoded** bytes — CRC32C/Castagnoli with a zero seed and a final bitwise
+inversion (not zlib's CRC32). `info` decodes the blocks and reports how many
+checksums it could verify; `dump` checks every block again before writing it.
+A mismatch produces a warning on stderr and that single block is skipped, so
+corrupt data is never silently passed off as zeros. Records whose checksum
+field is zero are treated as "no checksum" and reported as *unchecked*.
+
+`verified: N decoded blocks checked, 0 mismatches` is the quickest objective
+health check on a real `.adi`. If you see mismatches on an otherwise readable
+image, please include the count and a few warnings in a bug report.
 
 ### Stream to a disk
 
@@ -161,6 +176,12 @@ offset up front, then uses a bounded in-memory reorder window. For a normally
 ordered image the window stays almost empty, so there is no staging file and no
 large memory use.
 
+The block numbers in a VDB entry actually describe the *next* block, so region
+resolution is one global one-record shift across the whole index. An earlier
+version split the chain at metadata gaps and invented a region number for each
+run head; that turned an ordered index into a fake multi-gigabyte backward
+jump. Chain gaps are normal in real images and no longer affect ordering.
+
 If the window would exceed 256 MiB, `dump` switches to a **sparse temporary
 file**: the remaining clusters are written at their disk offsets with seeks,
 then the file is streamed to stdout in order and deleted. The output is
@@ -215,9 +236,14 @@ Same constraints as the tool it is based on, plus streaming-specific ones:
 * The block index is found by scanning the payload for record signatures. This
   is a linear pass over the `.adi` — fine for a one-off conversion, but it is
   the dominant cost on very large backups.
-* If blocks are wildly out of order, the 256 MiB reorder cap aborts the dump.
-* Header/footer CRC fields are parsed and displayed but not verified — there is
-  no published checksum algorithm for the container.
+* If blocks are wildly out of order, `dump` spills to a sparse temp file. Set
+  `ADI2RAW_NO_SPOOL=1` to make that an error instead. The block-index signature
+  scan and the standard `0x201`/`0x202`/`0x109` record path are not parsed, so
+  split image sets and images whose `ImgOffset` is not a raw file offset are not
+  supported.
+* Per-block `BRCrc32` values are verified. Header/footer CRC fields are parsed
+  and displayed but not verified — there is no published checksum algorithm for
+  the container.
 
 ---
 
@@ -229,12 +255,15 @@ Same constraints as the tool it is based on, plus streaming-specific ones:
 
 The suite builds the binary, generates synthetic `.adi` files — including a
 two-volume image with different cluster sizes, a four-partition image stored as
-one contiguous chain, and an eight-block image stored in reverse disk order —
-validates the GPT/MBR/NTFS structures in the output, checks marker bytes at
-their expected disk offsets, exercises a broken pipe, and runs a real
-`dump | dd` pipeline. The four-partition case is a regression test for volume
-discovery; the reverse-order case checks that the sparse spool produces exactly
-the same bytes as the in-memory path and cleans up after itself.
+one contiguous chain, an image with a deliberately wrong block checksum, a
+32 KiB-cluster image with a sparse one-byte bitmap, an ordered index with chain
+gaps, and an eight-block image stored in reverse disk order — validates the
+GPT/MBR/NTFS structures in the output, checks marker bytes at their expected
+disk offsets, exercises a broken pipe, and runs a real `dump | dd` pipeline.
+The four-partition case is a regression test for volume discovery; the
+reverse-order case checks that the sparse spool produces exactly the same bytes
+as the in-memory path and cleans up after itself. Unit tests cover the CRC32C
+vectors, the global region shift and the 32 KiB block layout.
 
 To also compare against the reference implementation:
 
