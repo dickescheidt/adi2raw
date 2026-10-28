@@ -346,6 +346,56 @@ ADI_EXTRACT=/path/to/adi-extract ./tests/run-tests.sh
 On the synthetic images, `dump` was verified byte-for-byte identical to
 `adi-extract reconstruct`.
 
+### Testing without a private backup
+
+The full suite includes deterministic randomized and malformed-input tests:
+
+* **Placement oracle:** 24 seeds vary cluster/block geometry, sparse bitmaps,
+  unused bitmap bits, region bases and partial final clusters. Expected partition
+  bytes are constructed directly from logical sector addresses, independently of
+  the production parser/decoder. The writer reuses fixture framing/CRC helpers,
+  so this is not an independent specification of the entire ADI format.
+* **Metamorphic tests:** each model is encoded six ways: direct, literal-only
+  compression, overlapping LZ4 matches, padded final blocks, regrouped VDB
+  references, and split members. Variants also reorder entries/storage and
+  relocate metadata. A member boundary falls inside stored block bytes. All six
+  must produce identical whole-disk output as well as match the placement oracle.
+* **Malformed-input smoke tests:** 128 deterministic cases cover truncation,
+  framing corruption, CRC-repaired structural mutations and compressed payload
+  corruption. POSIX subprocesses have 512 MiB address-space, three-second CPU,
+  six-second wall-clock and 32 MiB output-file limits. Expected errors/skips are
+  allowed; signals, panics and timeouts fail the tests.
+* **Decoder smoke fuzzing:** 4,096 deterministic short inputs plus known
+  overlapping matches and truncations. The C++ safety suite runs these under
+  AddressSanitizer/UBSan; Rust runs them as unit tests.
+
+These are bounded regression/smoke tests, not coverage-guided fuzzing or proof
+that arbitrary hostile inputs cannot exhaust resources. A real AOMEI restore
+comparison and independent filesystem checks remain necessary.
+
+For a longer reproducible placement run:
+
+```bash
+python3 tests/test_properties.py ./target/release/adi2raw rust --seeds 200
+```
+
+### Offset-only debug trace
+
+For the standard-record extraction path, `--debug` also emits `trace:` lines
+showing VDB region/block identity, stored logical offsets, member ordinals and
+physical read chunks, decoded size/checksum, bitmap and destination write ranges.
+Trace lines contain no recovered payload bytes, labels, GUIDs or filenames.
+They are not a substitute for the decoded checksum/skip diagnostics.
+
+```bash
+adi2raw --debug dump backup.adi > disk.img 2> debug.log
+grep 'trace:' debug.log > offsets.trace.txt
+```
+
+Review before sharing: the complete debug log can contain filenames/labels,
+and even an offset-only trace exposes disk geometry, sparse allocation and
+checksums. Tracing is opt-in and does not change recovered bytes.
+
 ## Licence
 
 MIT — see [LICENSE](LICENSE).

@@ -160,3 +160,7 @@ echo "ALL TESTS PASSED"
 python3 tests/test_boundary.py ./target/release/adi2raw rust
 
 python3 tests/test_warnings.py ./target/release/adi2raw rust
+
+python3 tests/test_properties.py ./target/release/adi2raw rust
+python3 tests/test_malformed.py ./target/release/adi2raw rust
+python3 tests/test_trace.py ./target/release/adi2raw rust

@@ -240,10 +240,11 @@ impl ImageSet {
         let mut out = Vec::with_capacity(len);
         let mut cur = logical;
         while out.len() < len {
-            let Some(m) = self
+            let Some((member, m)) = self
                 .members
                 .iter_mut()
-                .find(|m| cur >= m.logical_start && cur < m.logical_start + m.data_length)
+                .enumerate()
+                .find(|(_, m)| cur >= m.logical_start && cur < m.logical_start + m.data_length)
             else {
                 return Err(format!(
                     "image-set offset 0x{cur:x} is not covered by any member"
@@ -252,6 +253,13 @@ impl ImageSet {
             let avail =
                 (m.logical_start + m.data_length - cur).min((len - out.len()) as u64) as usize;
             let physical = m.header_size + (cur - m.logical_start);
+            debug_warn!(
+                "adi2raw: trace: read member={} logical=0x{:x} physical=0x{:x} bytes={}",
+                member,
+                cur,
+                physical,
+                avail
+            );
             m.file
                 .seek(SeekFrom::Start(physical))
                 .map_err(|e| format!("member seek {physical}: {e}"))?;

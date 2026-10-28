@@ -121,6 +121,8 @@ pub struct RecordSet {
 #[derive(Clone, Copy, Debug)]
 pub struct StdBlock {
     pub off: u64,
+    pub reg_no: u32,
+    pub block_no: u64,
     pub usize: u32,
     pub csize: u32,
     pub crc: u32,
@@ -643,6 +645,8 @@ pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
             .saturating_mul(bps);
             blocks.push(StdBlock {
                 off: e.img_offset,
+                reg_no: e.reg_no,
+                block_no: e.block_no,
                 usize: e.old_size,
                 csize: e.new_size,
                 crc: e.crc,

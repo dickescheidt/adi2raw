@@ -580,6 +580,8 @@ fn standard_writes(
     encrypt: Option<u32>,
     counts: &mut (u64, u64), // (crc checked, crc bad)
 ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    debug_warn!("adi2raw: trace: vdb region={} block={} logical=0x{:x} stored={} expected={} output_base=0x{:x} region_remaining={}",
+        b.reg_no, b.block_no, b.off, b.csize, b.usize, b.base, b.region_remaining);
     let comp = adi.read_logical(b.off, b.csize as usize)?;
     let data = if b.csize == b.usize {
         comp
@@ -623,6 +625,10 @@ fn standard_writes(
         }
     }
 
+    if DEBUG_DIAGNOSTICS.load(std::sync::atomic::Ordering::Relaxed) {
+        debug_warn!("adi2raw: trace: decoded logical=0x{:x} bytes={} crc_actual=0x{:08x} crc_expected=0x{:08x}",
+            b.off, data.len(), crc::br_crc32(&data), b.crc);
+    }
     let bmp = b.bitmap_len as usize;
     let cpb = b.clusters_per_block;
     let cluster = b.cluster as usize;
@@ -630,6 +636,13 @@ fn standard_writes(
         debug_warn!("adi2raw: warn: block at 0x{:x}: invalid bitmap/geometry; skipped; output needs verification", b.off);
         return Ok(Vec::new());
     }
+    debug_warn!(
+        "adi2raw: trace: bitmap logical=0x{:x} bytes={:02x?} clusters={} cluster_bytes={}",
+        b.off,
+        &data[..bmp],
+        cpb,
+        cluster
+    );
     let present = |u: u32| -> bool {
         let idx = (u >> 3) as usize;
         idx < bmp && data[idx] & (1u8 << (u & 7)) != 0
@@ -679,6 +692,15 @@ fn standard_writes(
             }
         }
         runs.push((dst, src, len));
+    }
+    for (dst, src, len) in &runs {
+        debug_warn!(
+            "adi2raw: trace: write logical=0x{:x} decoded_offset={} output=0x{:x} bytes={}",
+            b.off,
+            src,
+            dst,
+            len
+        );
     }
     Ok(runs
         .into_iter()

@@ -92,3 +92,43 @@ impl Lz4 {
         Ok(decoded)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Lz4;
+
+    #[test]
+    fn overlapping_matches_and_truncation() {
+        let mut decoder = Lz4::new();
+        assert_eq!(
+            decoder.decode(&[0x1f, b'A', 1, 0, 0]).unwrap(),
+            vec![b'A'; 20]
+        );
+        for bad in [
+            &[0xf0][..],
+            &[0x10, b'X', 0],
+            &[0, 0, 0],
+            &[0x1f, b'A', 1, 0],
+        ] {
+            decoder.reset();
+            assert!(decoder.decode(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn bounded_deterministic_decoder_smoke_fuzz() {
+        let mut state = 0x15a4e35u32;
+        let mut decoder = Lz4::new();
+        for case in 0..4096 {
+            let mut input = vec![0; case % 129];
+            for byte in &mut input {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *byte = (state >> 24) as u8;
+            }
+            decoder.reset();
+            let _ = decoder.decode(&input); // errors are expected; panic is not
+            decoder.reset();
+            assert_eq!(decoder.decode(&[0x30, b'A', b'B', b'C']).unwrap(), b"ABC");
+        }
+    }
+}
