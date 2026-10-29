@@ -99,7 +99,7 @@ with tempfile.TemporaryDirectory() as tmp:
             # Invalid references can force legacy fallback and fail; they must still warn.
             if case not in ('bad-reference',):
                 assert proc.returncode == 0, (case, command, proc.stderr)
-            wanted = b'info does not verify' if case == 'bad-checksum' and command == 'info' else expected
+            wanted = b'info verifies a sample' if case == 'bad-checksum' and command == 'info' else expected
             assert wanted in proc.stderr.lower(), (case, command, proc.stderr)
             if RUST and command == 'dump':
                 assert b'adi2raw: warn:' not in proc.stdout, 'diagnostics contaminated raw stdout'
@@ -158,7 +158,7 @@ with tempfile.TemporaryDirectory() as tmp:
                  [BINARY, 'info', str(image), '--debug']):
         proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         assert proc.returncode == 0 and proc.stdout == baseline.stdout, proc.stderr
-        assert b'info does not verify' in proc.stderr, proc.stderr
+        assert b'info verifies a sample' in proc.stderr, proc.stderr
     literal = subprocess.run([BINARY, 'info', '--', '--debug'], cwd=tmp, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert literal.returncode == 0 and b'warn' not in literal.stderr.lower(), literal.stderr
     print('flag positions / -- terminator / quiet default: OK')

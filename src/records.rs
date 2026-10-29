@@ -11,8 +11,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::adi::{u32le, u64le, utf16le_z, Adi};
+use crate::adi::{parse_boot_sector, u32le, u64le, utf16le_z, Adi};
 use crate::crc::br_crc32;
+use crate::lz4::Lz4;
 
 pub const TYPE_VOLUME_INDEX: u32 = 0x201;
 pub const TYPE_DATABLOCK_INDEX: u32 = 0x202;
@@ -139,7 +140,13 @@ pub struct StdBlock {
 #[derive(Clone, Debug)]
 pub struct StdVolume {
     pub label: String,
+    /// Filesystem name. Comes from the volume's own boot sector when that block
+    /// is recoverable; otherwise from the label heuristic (see `fs_detected`).
     pub fs: String,
+    /// True when `fs` was read from a boot sector rather than guessed.
+    pub fs_detected: bool,
+    /// Distinct cluster sizes across the volume's regions, ascending.
+    pub region_clusters: Vec<u32>,
     pub lba: u64,
     pub sectors: u64,
     pub cluster: u32,
@@ -534,6 +541,48 @@ fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
     Ok(sets)
 }
 
+/// Last-resort guess used when the volume's boot sector cannot be read.
+fn label_fs(label: &str) -> String {
+    let upper = label.to_uppercase();
+    if upper.contains("ESP") || upper.contains("EFI") {
+        "FAT32".into()
+    } else {
+        "NTFS".into()
+    }
+}
+
+/// Decode the block that stores the volume's first cluster and read its boot
+/// sector. `None` when that block is absent, undecodable, or does not start with
+/// a recognisable boot sector.
+fn probe_volume_boot(adi: &mut Adi, blocks: &[StdBlock], volume_start: u64) -> Option<String> {
+    let b = blocks
+        .iter()
+        .filter(|b| b.block_no == 0 && b.base == volume_start)
+        .min_by_key(|b| b.off)?;
+    if b.cluster == 0 || b.bitmap_len == 0 {
+        return None;
+    }
+    let comp = adi.read_logical(b.off, b.csize as usize).ok()?;
+    let data = if b.csize == b.usize {
+        comp
+    } else {
+        Lz4::new().decode_limited(&comp, b.usize as usize).ok()?
+    };
+    if data.len() != b.usize as usize || data.len() < b.bitmap_len as usize + 512 {
+        return None;
+    }
+    // Cluster 0 has to be present and is stored right after the bitmap.
+    if data[0] & 1 == 0 {
+        return None;
+    }
+    let bs = parse_boot_sector(&data[b.bitmap_len as usize..])?;
+    if bs.fs.is_empty() {
+        None
+    } else {
+        Some(bs.fs)
+    }
+}
+
 /// Parse the standard record path. Returns `None` when the image has no
 /// CRC-valid volume record sets (synthetic fixtures, older generations).
 pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
@@ -606,13 +655,8 @@ pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
             .first()
             .map(|r| r.cluster() as u32)
             .unwrap_or(512);
-        let fs = if label.to_uppercase().contains("ESP") || label.to_uppercase().contains("EFI") {
-            "FAT32".to_string()
-        } else {
-            "NTFS".to_string()
-        };
-
         let mut count = 0usize;
+        let set_block_start = blocks.len();
         let mut region_map: BTreeMap<u32, Region> = BTreeMap::new();
         for r in &set.regions {
             if region_map.insert(r.reg_no, *r).is_some() {
@@ -661,9 +705,30 @@ pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
             });
             count += 1;
         }
+        let mut region_clusters: Vec<u32> =
+            set.regions.iter().map(|r| r.cluster() as u32).collect();
+        region_clusters.sort_unstable();
+        region_clusters.dedup();
+        // The volume's first cluster holds its boot sector, which names the real
+        // filesystem. The label heuristic below is only a fallback: it labels any
+        // volume NTFS unless the label says ESP/EFI, which is wrong for FAT cards.
+        let detected = probe_volume_boot(adi, &blocks[set_block_start..], part_start * bps);
+        let (fs, fs_detected) = match detected {
+            Some(name) => (name, true),
+            None => {
+                debug_warn!(
+                    "adi2raw: warn: volume at LBA {}: boot sector not recoverable; filesystem '{}' is inferred from the label; verify output",
+                    part_start,
+                    label_fs(&label)
+                );
+                (label_fs(&label), false)
+            }
+        };
         volumes.push(StdVolume {
             label: label.clone(),
             fs,
+            fs_detected,
+            region_clusters,
             lba: part_start,
             sectors,
             cluster,

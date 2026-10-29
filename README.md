@@ -60,18 +60,31 @@ size:     14720 bytes (0.00 GiB)
   legacy volume runs
 
 [volumes]
-  v0 NTFS       lba 2048   sectors 4097   cluster 512   blocks 3  stored 1 KiB  label 'NTFS'
-  v1 NTFS       lba 8192   sectors 8193   cluster 4096  blocks 2  stored 12 KiB label 'NTFS'
+  v0 NTFS       lba 2048         sectors 4097         cluster 512    blocks 3 stored 1 KiB label 'NTFS'
+  v1 NTFS       lba 8192         sectors 8193         cluster 4096   blocks 2 stored 12 KiB label 'NTFS'
 
 [raw image]
   disk:      16419 sectors
   size:      8406528 bytes (0.01 GiB)
+
+[plan]
+  blocks: 5 in 2 chain run(s)
+  base range: 1048576 .. 4456448 bytes
+  index regions monotone: raw no, after resolve_regions no
+  out-of-order steps: 1, max backward jump: 0 MiB
+  estimated reorder need: 0 MiB
   blocks in disk order: no (reorder buffer streaming)
 ```
 
 `info` tells you the exact size of the stream, the volumes that will be
 reconstructed, and whether blocks are already in disk order. It does not modify
 anything.
+
+The filesystem in the volume line is read from that volume's own boot sector.
+When the boot sector did not survive in the backup, the name is guessed from
+the volume label and printed with a trailing `?` plus a footnote — treat it as
+a hint, not a fact. When the regions of one volume disagree on the cluster
+size, every size is listed, e.g. `cluster mixed (4096, 32768)`.
 
 ### Standard records and split image sets
 
@@ -113,15 +126,18 @@ with an error instead of silently omitting the block.
 
 Each 0x20-byte VDB index entry ends with a `BRCrc32` over the block's
 **decoded** bytes — CRC32C/Castagnoli with a zero seed and a final bitwise
-inversion (not zlib's CRC32). `info` decodes the blocks and reports how many
-checksums it could verify; `dump` checks every block again before writing it.
+inversion (not zlib's CRC32). On the standard-record path `info` decodes an
+evenly spread sample of 16 blocks and verifies their checksums; the legacy scan
+already decodes the whole chain. `dump` checks every block before writing it.
 A mismatch produces a warning on stderr and that single block is skipped, so
 corrupt data is never silently passed off as zeros. Records whose checksum
 field is zero are treated as "no checksum" and reported as *unchecked*.
 
-`verified: N decoded blocks checked, 0 mismatches` is the quickest objective
-health check on a real `.adi`. If you see mismatches on an otherwise readable
-image, please include the count and a few warnings in a bug report.
+`verified: C of T decoded blocks checked, 0 mismatches, U unchecked (dump
+verifies every block)` is the quickest objective health check on a real `.adi`.
+The sample is just that — a sample; a `--debug` note points at `dump` for a
+check of every block. If you see mismatches on an otherwise readable image,
+please include the count and a few warnings in a bug report.
 
 ### Stream to a disk
 
@@ -132,6 +148,16 @@ adi2raw dump "System Backup.adi" \
 
 Diagnostics go to **stderr**; stdout carries only raw bytes. `dump` refuses to
 write binary to a terminal, so a bare `adi2raw dump file.adi` is safe.
+
+After a successful dump, stderr ends with a coverage line:
+
+```console
+adi2raw: data: 196608 bytes of block data placed, 2966528 bytes left zero (6.216% of the 3163136-byte image)
+```
+
+The two numbers always add up to the image size. A real 8 GB card dump showed
+`0.552%`: that is normal for a mostly empty card, where the backup stores only
+used clusters and the rest is written as zeros.
 
 Other things you can do with the stream:
 
@@ -166,8 +192,11 @@ Concretely:
 
 * 512-byte sectors, total length `disk_sectors × 512`.
 * A **synthesised protective MBR + GPT** at the front and a backup GPT at the
-  end, built from the volumes found in the backup. Partition type GUIDs are
-  guessed from the filesystem.
+  end, built from the volumes found in the backup. Partition type GUIDs follow
+  the filesystem detected on the volume: Microsoft basic data for a recognised
+  filesystem, Microsoft reserved when none could be read, and EFI system only
+  for a FAT volume whose label says ESP or EFI. A last partition below 4 GiB
+  keeps the historical recovery-partition type.
 * Only the **used clusters** stored in the backup are written. Every gap is
   filled with zeros, which are streamed cheaply from a static zero buffer.
 * It is **not** a byte-exact forensic clone: the original partition table,
@@ -277,8 +306,9 @@ not the recovered bytes or exit status.
 Extended diagnostics cover unknown referenced records, rejected record-set
 candidates, missing or ambiguous metadata/modes, absent/unverified checksums,
 image-set gaps/overlaps, and inferred geometry or partition metadata. They also
-explain that `info` does not decode and verify all payload blocks. Correctly
-bounded partial final blocks are supported, not a geometry warning.
+say when a filesystem was guessed from the volume label and when `info` only
+verified a sample of decoded blocks. Correctly bounded partial final blocks are
+supported, not a geometry warning.
 
 A zero exit status is not proof of a complete or exact restore. Review recovery
 warnings; do not use partial output left by a failed command. This is a

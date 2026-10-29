@@ -42,8 +42,17 @@ fn put64(b: &mut [u8], o: usize, v: u64) {
     b[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+/// An EFI system partition is FAT *and* labelled as one. The old rule also
+/// required nothing but "FAT near the start of the disk", which mislabels an
+/// ordinary FAT data volume as soon as its filesystem is detected correctly
+/// instead of being guessed from the label.
+fn is_esp(v: &Volume) -> bool {
+    let label = v.label.to_uppercase();
+    v.fs.starts_with("FAT") && (label.contains("ESP") || label.contains("EFI"))
+}
+
 fn part_type(v: &Volume, last: bool) -> (&'static [u8; 16], &'static str) {
-    if v.fs.starts_with("FAT") && v.lba <= 4096 {
+    if is_esp(v) {
         (&ESP, "EFI system partition")
     } else if v.fs.is_empty() || v.fs == "raw" {
         (&MSR, "Microsoft reserved partition")

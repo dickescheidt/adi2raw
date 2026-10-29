@@ -165,3 +165,4 @@ python3 tests/test_properties.py ./target/release/adi2raw rust
 python3 tests/test_malformed.py ./target/release/adi2raw rust
 python3 tests/test_trace.py ./target/release/adi2raw rust
 python3 tests/test_robustness.py ./target/release/adi2raw rust
+python3 tests/test_fs_detect.py ./target/release/adi2raw rust

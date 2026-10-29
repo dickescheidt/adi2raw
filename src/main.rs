@@ -538,7 +538,6 @@ fn open_image(path: &Path) -> Result<Opened, String> {
     debug_warn!("adi2raw: warn: disk extent/layout is inferred and GPT may be reconstructed, not an exact original-disk restore; block checksums do not verify placement; verify layout and filesystem before use");
     if env::var_os("ADI2RAW_LEGACY_ONLY").is_none() {
         if let Some(std) = records::parse_standard(&mut adi)? {
-            debug_warn!("adi2raw: warn: standard-path filesystem type display is inferred from volume labels, not verified filesystem contents");
             eprintln!(
                 "adi2raw: standard record path: {} volume set(s), {} VDB entries, {} member(s)",
                 std.sets.len(),
@@ -742,16 +741,98 @@ fn standard_writes(
 }
 
 fn cmd_info(path: &Path) -> Result<(), String> {
-    debug_warn!("adi2raw: warn: info does not verify all decoded block contents/checksums; use extraction diagnostics and independent filesystem checks");
-    let opened = open_image(path)?;
+    debug_warn!("adi2raw: warn: info verifies a sample of decoded blocks; use dump for a full check of every block");
+    let mut opened = open_image(path)?;
     opened.adi.print_info();
     match &opened.kind {
-        ImageMap::Standard(std) => standard_info(&opened.adi, std),
+        ImageMap::Standard(std) => standard_info(&mut opened.adi, std),
         ImageMap::Legacy { blocks, map } => legacy_info(&opened.adi, blocks, map),
     }
 }
 
-fn standard_info(_adi: &Adi, std: &records::StandardImage) -> Result<(), String> {
+/// Cluster size shown in the volume line. Regions may disagree: a real card had
+/// 32 KiB clusters in one region and 4 KiB in the other, and printing just the
+/// first region's value was misleading.
+fn cluster_label(region_clusters: &[u32], fallback: u32) -> String {
+    match region_clusters {
+        [] => fallback.to_string(),
+        [one] => one.to_string(),
+        many => {
+            let list: Vec<String> = many.iter().map(|c| c.to_string()).collect();
+            format!("mixed ({})", list.join(", "))
+        }
+    }
+}
+
+/// How many blocks `info` decodes to verify BRCrc32; spread over the image.
+const INFO_SAMPLE: usize = 16;
+
+/// A recovery tool must say how much of the image it actually filled in: the
+/// exit status cannot distinguish "every cluster was free" from "most of the
+/// disk is a hole", and the difference decides whether the image is usable.
+fn report_coverage(placed: u64, disk_size: u64) {
+    let zero = disk_size.saturating_sub(placed);
+    let pct = if disk_size == 0 {
+        0.0
+    } else {
+        100.0 * placed as f64 / disk_size as f64
+    };
+    eprintln!(
+        "adi2raw: data: {placed} bytes of block data placed, {zero} bytes left zero ({pct:.3}% of the {disk_size}-byte image)"
+    );
+}
+
+fn sample_indices(n: usize, k: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if n <= k {
+        return (0..n).collect();
+    }
+    (0..k).map(|i| i * n / k).collect()
+}
+
+/// Decode one block without the diagnostics of the dump path.
+fn decode_block_quiet(adi: &mut Adi, b: &records::StdBlock) -> Option<Vec<u8>> {
+    let comp = adi.read_logical(b.off, b.csize as usize).ok()?;
+    let data = if b.csize == b.usize {
+        comp
+    } else {
+        Lz4::new().decode_limited(&comp, b.usize as usize).ok()?
+    };
+    if data.len() == b.usize as usize {
+        Some(data)
+    } else {
+        None
+    }
+}
+
+fn verify_sample(adi: &mut Adi, std: &records::StandardImage, sample: &[usize]) -> (u64, u64) {
+    let mut checked = 0u64;
+    let mut bad = 0u64;
+    for &i in sample {
+        let Some(b) = std.blocks.get(i) else { continue };
+        if b.crc == 0 {
+            continue;
+        }
+        let Some(data) = decode_block_quiet(adi, b) else {
+            continue;
+        };
+        checked += 1;
+        if crc::br_crc32(&data) != b.crc {
+            bad += 1;
+            eprintln!(
+                "adi2raw: warn: block at 0x{:x}: BRCrc32 mismatch (got 0x{:08x}, expected 0x{:08x})",
+                b.off,
+                crc::br_crc32(&data),
+                b.crc
+            );
+        }
+    }
+    (checked, bad)
+}
+
+fn standard_info(adi: &mut Adi, std: &records::StandardImage) -> Result<(), String> {
     println!("\n[standard records]");
     println!("  volume record sets: {}", std.sets.len());
     for (i, s) in std.sets.iter().enumerate() {
@@ -792,10 +873,23 @@ fn standard_info(_adi: &Adi, std: &records::StandardImage) -> Result<(), String>
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".into())
     );
-    println!(
-        "  crcs:       {} blocks carry a BRCrc32 checksum",
-        std.blocks.iter().filter(|b| b.crc != 0).count()
-    );
+    let crcs = std.blocks.iter().filter(|b| b.crc != 0).count();
+    println!("  crcs:       {crcs} blocks carry a BRCrc32 checksum");
+    if crcs != 0 {
+        // info used to print the checksum count without ever testing one. Decode
+        // a bounded, evenly spread sample instead of the whole image: enough to
+        // catch a systematic decoder or placement problem, cheap on a 1 TB set.
+        let sample = sample_indices(std.blocks.len(), INFO_SAMPLE);
+        let (checked, bad) = verify_sample(adi, std, &sample);
+        println!(
+            "  verified:  {} of {} decoded blocks checked, {} {}, {} unchecked (dump verifies every block)",
+            checked,
+            crcs,
+            bad,
+            if bad == 1 { "mismatch" } else { "mismatches" },
+            (crcs as u64).saturating_sub(checked)
+        );
+    }
     if std.skipped_regions != 0 {
         println!(
             "  skipped:    {} VDB entries with no matching region",
@@ -804,9 +898,21 @@ fn standard_info(_adi: &Adi, std: &records::StandardImage) -> Result<(), String>
     }
     println!("\n[volumes]");
     for (i, v) in std.volumes.iter().enumerate() {
+        let clusters = cluster_label(&v.region_clusters, v.cluster);
         println!(
-            "  v{} {:<10} lba {:<12} sectors {:<12} cluster {:<6} blocks {} label '{}'",
-            i, v.fs, v.lba, v.sectors, v.cluster, v.blocks, v.label
+            "  v{} {:<10} lba {:<12} sectors {:<12} cluster {:<16} blocks {} label '{}'",
+            i,
+            format!("{}{}", v.fs, if v.fs_detected { "" } else { "?" }),
+            v.lba,
+            v.sectors,
+            clusters,
+            v.blocks,
+            v.label
+        );
+    }
+    if std.volumes.iter().any(|v| !v.fs_detected) {
+        println!(
+            "  ('?' = filesystem guessed from the label; its boot sector was not recoverable)"
         );
     }
     let disk_size = std.disk_sectors * SECTOR;
@@ -1000,6 +1106,9 @@ fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), Strin
             std.blocks.len()
         ));
     }
+    if !st.broken {
+        report_coverage(placed, disk_size);
+    }
     Ok(())
 }
 
@@ -1091,6 +1200,9 @@ fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(),
             plan.len()
         ));
     }
+    if !st.broken {
+        report_coverage(placed, disk_size);
+    }
     Ok(())
 }
 
@@ -1157,7 +1269,14 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::Streamer;
+    use super::{cluster_label, Streamer};
+
+    #[test]
+    fn cluster_label_reports_mixed_region_geometries() {
+        assert_eq!(cluster_label(&[], 4096), "4096");
+        assert_eq!(cluster_label(&[4096], 512), "4096");
+        assert_eq!(cluster_label(&[4096, 32768], 4096), "mixed (4096, 32768)");
+    }
 
     #[test]
     fn later_write_inside_pending_range_keeps_the_tail() {
