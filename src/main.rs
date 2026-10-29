@@ -56,10 +56,16 @@ impl Spool {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let path = dir.join(format!("adi2raw-{}-{nonce}.spool", std::process::id()));
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        // The spool holds recovered partition data. Create it owner-only instead
+        // of relying on the umask (0644 on a default system) in a shared /tmp.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&path)
             .map_err(|e| format!("cannot create spool {}: {e}", path.display()))?;
         Ok(Self { file, path })
@@ -159,14 +165,28 @@ impl<W: Write> Streamer<W> {
             .ok_or("write offset overflow")?;
 
         let before: Vec<u64> = self.pending.range(..off).map(|(&k, _)| k).collect();
+        let mut tails: Vec<(u64, Vec<u8>)> = Vec::new();
         for k in before {
             let e = self.pending.get_mut(&k).unwrap();
-            if k + e.len() as u64 > off {
-                e.truncate((off - k) as usize);
-                if e.is_empty() {
-                    self.pending.remove(&k);
-                }
+            let e_end = k + e.len() as u64;
+            if e_end <= off {
+                continue;
             }
+            // The new write covers [off, end). If the older range extends past
+            // `end`, that remainder must survive: dropping it silently zeroes
+            // recovered data, because `zero_fill` later treats the gap as a hole.
+            if e_end > end {
+                tails.push((end, e[(end - k) as usize..].to_vec()));
+            }
+            e.truncate((off - k) as usize);
+            if e.is_empty() {
+                self.pending.remove(&k);
+            }
+        }
+        // Only fill holes: a queued write that already starts at `end` was
+        // issued later and wins over the older tail.
+        for (at, tail) in tails {
+            self.pending.entry(at).or_insert(tail);
         }
         let inside: Vec<u64> = self.pending.range(off..end).map(|(&k, _)| k).collect();
         for k in inside {
@@ -357,10 +377,13 @@ fn block_writes(
     crc_bad: &mut u64,
 ) -> Result<Vec<(u64, Vec<u8>)>, String> {
     let comp = adi.read_logical(b.off, b.csize as usize)?;
-    let data = match dec.decode(&comp) {
+    let data = match dec.decode_limited(&comp, b.usize as usize) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("adi2raw: warn: block at 0x{:x}: {e}", b.off);
+            eprintln!(
+                "adi2raw: warn: block at 0x{:x}: LZ4 decode failed: {e} — skipped",
+                b.off
+            );
             return Ok(Vec::new());
         }
     };
@@ -598,9 +621,19 @@ fn standard_writes(
         if compress == Some(0) {
             debug_warn!("adi2raw: warn: block at 0x{:x}: compression mode 0 but unequal stored/decoded sizes; attempting LZ4; verify output", b.off);
         }
-        Lz4::new()
-            .decode(&comp)
-            .map_err(|e| format!("block at 0x{:x}: {e}", b.off))?
+        // A damaged block must not discard the whole image: warn and skip it,
+        // exactly like the legacy path and the C++ implementation. The run
+        // still fails if no block at all could be decoded (see dump_standard).
+        match Lz4::new().decode_limited(&comp, b.usize as usize) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!(
+                    "adi2raw: warn: block at 0x{:x}: LZ4 decode failed: {e} — skipped",
+                    b.off
+                );
+                return Ok(Vec::new());
+            }
+        }
     };
     if data.len() != b.usize as usize {
         eprintln!(
@@ -927,6 +960,7 @@ fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), Strin
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
     let mut counts = (0u64, 0u64);
+    let mut placed = 0u64;
     for (i, b) in std.blocks.iter().enumerate() {
         let writes = standard_writes(
             &mut adi,
@@ -937,6 +971,7 @@ fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), Strin
             &mut counts,
         )?;
         for (dst, bytes) in writes {
+            placed += bytes.len() as u64;
             st.add(dst, bytes)?;
         }
         st.flush_to(fmin[i])?;
@@ -955,6 +990,14 @@ fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), Strin
         return Err(format!(
             "internal error: wrote {} bytes, expected {}",
             st.total, disk_size
+        ));
+    }
+    // Match the C++ tool: a run that placed nothing is a failure, not a
+    // zero-filled success. Partial recovery stays a success with warnings.
+    if !st.broken && placed == 0 && !std.blocks.is_empty() {
+        return Err(format!(
+            "no VDB block could be decoded; nothing was recovered from {} block(s)",
+            std.blocks.len()
         ));
     }
     Ok(())
@@ -1001,6 +1044,7 @@ fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(),
 
     let mut dec = Lz4::new();
     let mut crc_bad = 0u64;
+    let mut placed = 0u64;
     for (pi, entry) in plan.iter().enumerate() {
         let b = &blocks[entry.bi];
         if entry.bi == 0 || blocks[entry.bi - 1].end() != b.off {
@@ -1016,6 +1060,7 @@ fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(),
             &mut crc_bad,
         )?;
         for (dst, bytes) in writes {
+            placed += bytes.len() as u64;
             st.add(dst, bytes)?;
         }
         st.flush_to(fmin[pi])?;
@@ -1038,6 +1083,12 @@ fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(),
         return Err(format!(
             "internal error: wrote {} bytes, expected {}",
             st.total, disk_size
+        ));
+    }
+    if !st.broken && placed == 0 && !plan.is_empty() {
+        return Err(format!(
+            "no block could be decoded; nothing was recovered from {} block(s)",
+            plan.len()
         ));
     }
     Ok(())
@@ -1101,5 +1152,47 @@ fn main() -> ExitCode {
             eprintln!("adi2raw: error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Streamer;
+
+    #[test]
+    fn later_write_inside_pending_range_keeps_the_tail() {
+        // The second write starts inside the first one and ends before it, which
+        // used to drop the first write's 85-byte tail and zero-fill that range.
+        let mut st = Streamer::new(Vec::new(), 1 << 20);
+        st.add(0, vec![b'A'; 100]).unwrap();
+        st.add(10, vec![b'B'; 5]).unwrap();
+        st.finish(100).unwrap();
+        assert_eq!(st.total, 100);
+        assert_eq!(&st.out[..10], &[b'A'; 10]);
+        assert_eq!(&st.out[10..15], b"BBBBB");
+        assert_eq!(&st.out[15..], &[b'A'; 85]);
+    }
+
+    #[test]
+    fn write_fully_inside_pending_range_splits_it() {
+        let mut st = Streamer::new(Vec::new(), 1 << 20);
+        st.add(0, vec![b'A'; 100]).unwrap();
+        st.add(40, vec![b'B'; 20]).unwrap();
+        st.finish(100).unwrap();
+        assert_eq!(&st.out[..40], &[b'A'; 40]);
+        assert_eq!(&st.out[40..60], &[b'B'; 20]);
+        assert_eq!(&st.out[60..], &[b'A'; 40]);
+    }
+
+    #[test]
+    fn a_queued_write_at_the_new_end_is_not_overwritten() {
+        let mut st = Streamer::new(Vec::new(), 1 << 20);
+        st.add(0, vec![b'A'; 100]).unwrap();
+        st.add(200, vec![b'C'; 10]).unwrap();
+        st.add(50, vec![b'B'; 150]).unwrap();
+        st.finish(210).unwrap();
+        assert_eq!(&st.out[..50], &[b'A'; 50]);
+        assert_eq!(&st.out[50..200], &[b'B'; 150]);
+        assert_eq!(&st.out[200..], &[b'C'; 10]);
     }
 }

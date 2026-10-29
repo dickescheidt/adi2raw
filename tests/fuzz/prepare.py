@@ -31,8 +31,8 @@ common += 'mod records { include!("records_copy.rs"); }\n'
 common = common.replace('mod records { include!("records_copy.rs"); }','#[path = "records_copy.rs"] mod records;')
 for name, code in {
  'codec': '''let mut dec = lz4::Lz4::new();
- let _ = dec.decode(data);
- if !data.is_empty() { let at = data[0] as usize % data.len(); dec.reset(); let _ = dec.decode(&data[..at]); let _ = dec.decode(&data[at..]); }
+ let _ = dec.decode_limited(data, 1 << 20);
+ if !data.is_empty() { let at = data[0] as usize % data.len(); dec.reset(); let _ = dec.decode_limited(&data[..at], 1 << 20); let _ = dec.decode_limited(&data[at..], 1 << 20); }
  let _ = adi::split_block(data, data.len() as u32, 0);''',
  'records': 'records::fuzz_records(data);',
  'image_file': '''if data.len() > 65536 { return; }

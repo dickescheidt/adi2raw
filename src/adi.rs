@@ -33,17 +33,19 @@ pub(crate) fn u64le(b: &[u8], o: usize) -> u64 {
 }
 
 pub(crate) fn utf16le_z(b: &[u8]) -> String {
-    let mut out = String::new();
+    // Collect raw UTF-16 code units first: `from_u32` per unit would turn every
+    // surrogate pair (anything above U+FFFF) into two replacement characters.
+    let mut units: Vec<u16> = Vec::with_capacity(b.len() / 2);
     let mut i = 0;
     while i + 1 < b.len() {
-        let cp = u16::from_le_bytes([b[i], b[i + 1]]);
+        let unit = u16::from_le_bytes([b[i], b[i + 1]]);
         i += 2;
-        if cp == 0 {
+        if unit == 0 {
             break;
         }
-        out.push(char::from_u32(cp as u32).unwrap_or('?'));
+        units.push(unit);
     }
-    out
+    String::from_utf16_lossy(&units)
 }
 
 fn guid_str(g: &[u8; 16]) -> String {
@@ -867,7 +869,7 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
             dec.reset();
         }
         let comp = adi.read_logical(b.off, b.csize as usize)?;
-        let data = match dec.decode(&comp) {
+        let data = match dec.decode_limited(&comp, b.usize as usize) {
             Ok(d) if d.len() == b.usize as usize => d,
             _ => {
                 debug_warn!("adi2raw: warn: block at 0x{:x}: decode/size/layout failure during discovery; skipped; verify output", b.off);
@@ -1091,7 +1093,9 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
         let stop = std::cmp::min(last + 1, first + 512);
         for b in &blocks[first..stop] {
             let comp = adi.read_logical(b.off, b.csize as usize)?;
-            let data = dec.decode(&comp).unwrap_or_default();
+            let data = dec
+                .decode_limited(&comp, b.usize as usize)
+                .unwrap_or_default();
             if data.len() != b.usize as usize || !b.crc_ok(&data) {
                 debug_warn!("adi2raw: warn: block at 0x{:x}: decode/size/checksum failure during volume probe; skipped; verify output", b.off);
                 continue;
