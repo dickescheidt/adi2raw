@@ -97,12 +97,18 @@ impl Lz4 {
                 ));
             }
 
-            // Overlapping copy: as `work` grows, `start + i` reads bytes that
-            // were appended by earlier iterations of this same loop.
+            // Overlapping copy. Copying byte by byte (the obvious reading of
+            // the format) ran at ~1.5 GB/s and dominated a whole-disk dump;
+            // instead copy in doubling steps. The first `off` bytes of the
+            // match are already in place, so after `written` bytes the window
+            // [start, start + off + written) is final and its phase is 0 mod
+            // `off`, which is exactly what the periodic continuation needs.
             let start = self.work.len() - off;
-            for i in 0..mlen {
-                let b = self.work[start + i];
-                self.work.push(b);
+            let mut written = 0usize;
+            while written < mlen {
+                let n = (mlen - written).min(off + written);
+                self.work.extend_from_within(start..start + n);
+                written += n;
             }
         }
 

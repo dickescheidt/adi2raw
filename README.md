@@ -139,6 +139,26 @@ The sample is just that — a sample; a `--debug` note points at `dump` for a
 check of every block. If you see mismatches on an otherwise readable image,
 please include the count and a few warnings in a bug report.
 
+### How fast it runs
+
+`dump` is single-threaded, so it is worth knowing where the time goes:
+
+* **No full pass before the first byte.** The standard record block is searched
+  in the last 4 MiB of the container. On a 70 GiB image the old build read all
+  70 GiB (~70 s at 1 GB/s) before writing anything; it now starts in
+  milliseconds. If the records are not in that window the tool falls back to
+  scanning the whole file, and `ADI2RAW_FULL_SCAN=1` forces that path.
+* **BRCrc32 uses slicing-by-16**, 16 bytes per iteration instead of one. Every
+  decoded byte is checksummed, and the byte-at-a-time table ran at ~0.43 GB/s
+  on a 2.6 GHz core, which capped the whole dump; the sliced version runs at
+  ~2.4 GB/s.
+* **LZ4 matches are copied in doubling steps** instead of byte by byte.
+
+Measured on a 2.6 GHz VM, image to `/dev/null`: 4 GiB of compressible blocks
+12.8 s → 2.5 s, 2 GiB of stored blocks 10.3 s → 2.3 s, and an image that is
+99.98 % zeros (70 GiB of output) 3.4 s. Beyond that, the disk read and the
+consumer (`dd bs=1M`) are the limits, not the decoder.
+
 ### Stream to a disk
 
 ```bash
@@ -330,9 +350,10 @@ Same constraints as the tool it is based on, plus streaming-specific ones:
 * `.afi` file backups are a different container and are **not** supported.
 * Volume geometry is inferred from NTFS/FAT boot sectors; BitLocker, exFAT and
   unknown filesystems are detected but not usefully mapped.
-* The block index is found by scanning the payload for record signatures. This
-  is a linear pass over the `.adi` — fine for a one-off conversion, but it is
-  the dominant cost on very large backups.
+* The standard record block is searched in the last 4 MiB of the container;
+  anything else falls back to a linear scan of the whole `.adi`. The legacy
+  signature-scan parser (images without standard records) always scans it all,
+  which is the dominant cost on very large backups.
 * If blocks are wildly out of order, `dump` spills to a sparse temp file. Set
   `ADI2RAW_NO_SPOOL=1` to make that an error instead.
 * Split image sets need their extra members supplied explicitly via

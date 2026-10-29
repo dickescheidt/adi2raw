@@ -311,11 +311,19 @@ fn parse_vdb(raw: &[u8], p: usize) -> Option<VdbEntry> {
     })
 }
 
-/// Scan the primary member's physical bytes for CRC-valid standard headers.
-fn scan_headers(adi: &mut Adi) -> Result<Vec<StdHeader>, String> {
-    let end = adi.file_size;
+/// Bytes at the end of the primary member that are searched before the whole
+/// file. AOMEI writes the record block (0x201/0x202/0x109/0x102 and the mode
+/// records) after the payload, so the real image's records sit in the last few
+/// kilobytes. Four MiB leaves room for hundreds of volumes and has to be read
+/// once instead of the whole file.
+const TAIL_WINDOW: u64 = 4 * 1024 * 1024;
+
+/// Scan `[from, to)` of the primary member's physical bytes for CRC-valid
+/// standard headers.
+fn scan_headers_range(adi: &mut Adi, from: u64, to: u64) -> Result<Vec<StdHeader>, String> {
+    let end = to.min(adi.file_size);
     let mut candidates: Vec<u64> = Vec::new();
-    let mut at = 0u64;
+    let mut at = from;
     while at < end {
         let want = std::cmp::min((CHUNK + OVERLAP) as u64, end - at) as usize;
         if want <= OVERLAP {
@@ -346,6 +354,11 @@ fn scan_headers(adi: &mut Adi) -> Result<Vec<StdHeader>, String> {
         }
     }
     Ok(out)
+}
+
+fn scan_headers(adi: &mut Adi) -> Result<Vec<StdHeader>, String> {
+    let end = adi.file_size;
+    scan_headers_range(adi, 0, end)
 }
 
 /// Read VDB entries from a data-block reference using the record-set delta.
@@ -380,8 +393,81 @@ fn shifted(offset: u64, delta: i64) -> Option<u64> {
 /// independent implementation uses: a 0x201's 0x202 directory entry points at
 /// the *end* of the VDB table, and the matching 0x202 header fixes the delta.
 fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
+    // Reading the whole file to find a record block that is normally in the
+    // last few kilobytes costs a full pass over the image (70 s for 70 GiB at
+    // 1 GB/s) before the first output byte. Search the tail first and accept it
+    // only when it yields exactly one complete, self-consistent record set;
+    // otherwise fall back to the exhaustive scan, which is what older images
+    // and unusual layouts get. ADI2RAW_FULL_SCAN=1 forces the exhaustive scan.
+    if std::env::var_os("ADI2RAW_FULL_SCAN").is_none() && adi.file_size > TAIL_WINDOW {
+        let from = adi.file_size - TAIL_WINDOW;
+        let headers = scan_headers_range(adi, from, adi.file_size)?;
+        let indexes = headers
+            .iter()
+            .filter(|h| h.rec_type == TYPE_VOLUME_INDEX)
+            .count();
+        let sets = build_record_sets(adi, headers)?;
+        let ok = indexes == 1 && sets.len() == 1 && set_is_plausible(adi, &sets[0]);
+        if ok {
+            debug_warn!(
+                "adi2raw: trace: record scan: last {} bytes of {} (one 0x201, complete set)",
+                TAIL_WINDOW,
+                adi.file_size
+            );
+            return Ok(sets);
+        }
+        debug_warn!(
+            "adi2raw: trace: record scan: last {} bytes gave {} 0x201 record(s) and {} usable set(s); scanning the whole file",
+            TAIL_WINDOW,
+            indexes,
+            sets.len()
+        );
+    }
+    let end = adi.file_size;
+    debug_warn!("adi2raw: trace: record scan: whole file ({} bytes)", end);
     let headers = scan_headers(adi)?;
+    build_record_sets(adi, headers)
+}
 
+/// Structural sanity gate for the tail scan. A set that passes is one the
+/// parser could have produced from a complete record block: the declared VDB
+/// count is what was read, every entry addresses stored bytes inside the image
+/// set, and at least one entry is the first block of a region. A set that
+/// fails sends the caller through the exhaustive scan, so a false negative
+/// only costs time.
+fn set_is_plausible(adi: &Adi, set: &RecordSet) -> bool {
+    if set.entries.is_empty() || set.regions.is_empty() {
+        return false;
+    }
+    if set.entries.len() != set.entry_count as usize || set.metadata.is_empty() {
+        return false;
+    }
+    let logical_end = adi
+        .image_set
+        .info()
+        .iter()
+        .map(|m| m.logical_start.saturating_add(m.data_length))
+        .max()
+        .unwrap_or(0);
+    if logical_end == 0 {
+        return false;
+    }
+    let mut first_block = false;
+    for e in &set.entries {
+        if e.old_size == 0 || e.new_size == 0 {
+            return false;
+        }
+        if e.img_offset.checked_add(e.new_size as u64) > Some(logical_end) {
+            return false;
+        }
+        if e.block_no == 0 {
+            first_block = true;
+        }
+    }
+    first_block
+}
+
+fn build_record_sets(adi: &mut Adi, headers: Vec<StdHeader>) -> Result<Vec<RecordSet>, String> {
     let mut data_blocks: Vec<DataBlockIndex> = Vec::new();
     for h in headers
         .iter()
