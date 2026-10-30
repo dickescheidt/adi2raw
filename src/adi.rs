@@ -13,6 +13,7 @@ use crate::lz4::Lz4;
 
 pub const REGION: u64 = 256 * 1024;
 pub const SECTOR: u64 = 512;
+const MAX_CONTAINER_PART: u64 = 1024 * 1024;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -156,7 +157,11 @@ fn container_fields(path: &Path) -> Result<(u64, u64, u64, u64, u64)> {
         return Err(format!("{} has no BIFT footer", path.display()));
     }
     let tsize = u32le(&tail, 8) as u64;
-    if hsize < 16 || hsize > size || tsize < 16 || tsize > size - hsize {
+    if !(16..=MAX_CONTAINER_PART).contains(&hsize)
+        || hsize > size
+        || !(16..=MAX_CONTAINER_PART).contains(&tsize)
+        || tsize > size - hsize
+    {
         return Err(format!("{}: invalid container sizes", path.display()));
     }
     let mut hdr = vec![0u8; hsize as usize];
@@ -205,6 +210,8 @@ impl ImageSet {
                 debug_warn!("adi2raw: warn: {}: absent/invalid image-set length; using physical payload bounds; verify member mapping", p.display());
             }
             let data_length = if dlen > 0 { dlen.min(payload) } else { payload };
+            doff.checked_add(data_length)
+                .ok_or_else(|| format!("{}: image-set member range overflows", p.display()))?;
             let file = File::open(p).map_err(|e| format!("cannot open {}: {e}", p.display()))?;
             members.push(MemberState {
                 file,
@@ -239,22 +246,58 @@ impl ImageSet {
     }
 
     pub fn read(&mut self, logical: u64, len: usize) -> Result<Vec<u8>> {
+        let len_u64 = u64::try_from(len).map_err(|_| "image-set read length is too large")?;
+        let requested_end = logical
+            .checked_add(len_u64)
+            .ok_or("image-set read range overflows")?;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Validate the whole logical range before allocating its output buffer.
+        // A malformed VDB offset/size must report an uncovered range, not panic
+        // or attempt an allocation based on untrusted metadata.
+        let mut covered = logical;
+        while covered < requested_end {
+            let Some(m) = self.members.iter().find(|m| {
+                m.logical_start <= covered
+                    && m.logical_start
+                        .checked_add(m.data_length)
+                        .is_some_and(|end| covered < end)
+            }) else {
+                return Err(format!(
+                    "image-set offset 0x{covered:x} is not covered by any member"
+                ));
+            };
+            let member_end = m
+                .logical_start
+                .checked_add(m.data_length)
+                .ok_or("image-set member range overflows")?;
+            covered = requested_end.min(member_end);
+        }
+
         let mut out = Vec::with_capacity(len);
         let mut cur = logical;
         while out.len() < len {
-            let Some((member, m)) = self
-                .members
-                .iter_mut()
-                .enumerate()
-                .find(|(_, m)| cur >= m.logical_start && cur < m.logical_start + m.data_length)
-            else {
+            let Some((member, m)) = self.members.iter_mut().enumerate().find(|(_, m)| {
+                m.logical_start <= cur
+                    && m.logical_start
+                        .checked_add(m.data_length)
+                        .is_some_and(|end| cur < end)
+            }) else {
                 return Err(format!(
                     "image-set offset 0x{cur:x} is not covered by any member"
                 ));
             };
-            let avail =
-                (m.logical_start + m.data_length - cur).min((len - out.len()) as u64) as usize;
-            let physical = m.header_size + (cur - m.logical_start);
+            let member_end = m
+                .logical_start
+                .checked_add(m.data_length)
+                .ok_or("image-set member range overflows")?;
+            let avail = (member_end - cur).min((len - out.len()) as u64) as usize;
+            let physical = m
+                .header_size
+                .checked_add(cur - m.logical_start)
+                .ok_or("image-set physical offset overflows")?;
             debug_warn!(
                 "adi2raw: trace: read member={} logical=0x{:x} physical=0x{:x} bytes={}",
                 member,
@@ -270,7 +313,9 @@ impl ImageSet {
                 .read_exact(&mut buf)
                 .map_err(|e| format!("member read {physical}+{avail}: {e}"))?;
             out.extend_from_slice(&buf);
-            cur += avail as u64;
+            cur = cur
+                .checked_add(avail as u64)
+                .ok_or("image-set read cursor overflows")?;
         }
         Ok(out)
     }
@@ -347,6 +392,9 @@ impl Adi {
         let checksum = u32le(&tail, 4);
         if fsize < 16 || fsize as u64 > file_size {
             fsize = 16;
+        }
+        if fsize as u64 > MAX_CONTAINER_PART {
+            return Err(format!("implausible BIFT size {fsize}"));
         }
         let mut blob = vec![0u8; fsize as usize];
         file.seek(SeekFrom::Start(file_size - fsize as u64))
@@ -761,8 +809,13 @@ pub fn parse_boot_sector(p: &[u8]) -> Option<BootSector> {
         data_start: 0,
     };
     if &p[3..11] == b"NTFS    " {
+        let total_sectors = u64le(p, 40);
+        let max_addressable = u64::MAX / SECTOR - u32::MAX as u64 - 35;
+        if total_sectors > max_addressable {
+            return None;
+        }
         bs.fs = "NTFS".into();
-        bs.total_sectors = u64le(p, 40);
+        bs.total_sectors = total_sectors;
         return Some(bs);
     }
     if &p[3..11] == b"-FVE-FS-" {
@@ -872,6 +925,7 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
         let data = match dec.decode_limited(&comp, b.usize as usize) {
             Ok(d) if d.len() == b.usize as usize => d,
             _ => {
+                dec.reset();
                 debug_warn!("adi2raw: warn: block at 0x{:x}: decode/size/layout failure during discovery; skipped; verify output", b.off);
                 continue;
             }
@@ -879,6 +933,7 @@ fn scan_boot_sectors(adi: &mut Adi, blocks: &[BlockRec]) -> Result<BootScan> {
         if b.crc != 0 {
             out.crc_checked += 1;
             if !b.crc_ok(&data) {
+                dec.reset();
                 out.crc_bad += 1;
                 debug_warn!("adi2raw: warn: block at 0x{:x}: checksum mismatch during discovery; skipped; verify output", b.off);
                 continue;
@@ -1093,6 +1148,7 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
                 .decode_limited(&comp, b.usize as usize)
                 .unwrap_or_default();
             if data.len() != b.usize as usize || !b.crc_ok(&data) {
+                dec.reset();
                 debug_warn!("adi2raw: warn: block at 0x{:x}: decode/size/checksum failure during volume probe; skipped; verify output", b.off);
                 continue;
             }
@@ -1174,6 +1230,65 @@ pub fn block_base(vol: &Volume, b: &BlockRec) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_oversized_additional_member_footer_before_allocating() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "adi2raw-container-limit-{}-{}.adi",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let footer_size = MAX_CONTAINER_PART + 1;
+        let file_size = 0x40 + footer_size;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(file_size).unwrap();
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(b"BIFH");
+        header[4..8].copy_from_slice(&0x40u32.to_le_bytes());
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&header).unwrap();
+        let mut footer_tail = [0u8; 16];
+        footer_tail[8..12].copy_from_slice(&(footer_size as u32).to_le_bytes());
+        footer_tail[12..16].copy_from_slice(b"BIFT");
+        file.seek(SeekFrom::Start(file_size - 16)).unwrap();
+        file.write_all(&footer_tail).unwrap();
+        drop(file);
+
+        let result = container_fields(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn image_set_rejects_uncovered_read_before_allocating() {
+        let mut image_set = ImageSet {
+            members: Vec::new(),
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            image_set.read(0, usize::MAX)
+        }));
+        assert!(result.is_ok(), "uncovered range panicked before validation");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn rejects_ntfs_geometry_whose_byte_size_cannot_be_represented() {
+        let mut boot = vec![0u8; 512];
+        boot[0] = 0xeb;
+        boot[3..11].copy_from_slice(b"NTFS    ");
+        boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+        boot[13] = 8;
+        boot[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+        boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+        assert!(parse_boot_sector(&boot).is_none());
+    }
 
     #[test]
     fn resolve_regions_is_one_global_shift() {

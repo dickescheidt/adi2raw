@@ -458,6 +458,7 @@ fn block_writes(
     let data = match dec.decode_limited(&comp, b.usize as usize) {
         Ok(d) => d,
         Err(e) => {
+            dec.reset();
             eprintln!(
                 "adi2raw: warn: block at 0x{:x}: LZ4 decode failed: {e} — skipped",
                 b.off
@@ -466,6 +467,7 @@ fn block_writes(
         }
     };
     if data.len() != b.usize as usize {
+        dec.reset();
         eprintln!(
             "adi2raw: warn: block at 0x{:x} decoded to {} bytes, expected {}",
             b.off,
@@ -481,6 +483,7 @@ fn block_writes(
         );
     }
     if !b.crc_ok(&data) {
+        dec.reset();
         *crc_bad += 1;
         eprintln!(
             "adi2raw: warn: block at 0x{:x}: CRC32C mismatch (got 0x{:08x}, expected 0x{:08x}) — skipped",
@@ -988,7 +991,10 @@ fn standard_info(adi: &mut Adi, std: &records::StandardImage) -> Result<(), Stri
             "  ('?' = filesystem guessed from the label; its boot sector was not recoverable)"
         );
     }
-    let disk_size = std.disk_sectors * SECTOR;
+    let disk_size = std
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     println!("\n[raw image]");
     println!("  disk:      {} sectors", std.disk_sectors);
     println!(
@@ -1050,7 +1056,10 @@ fn legacy_info(_adi: &Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(), S
             i, v.fs, v.lba, v.sectors, v.cluster, v.last - v.first + 1, v.stored / 1024, v.label
         );
     }
-    let disk_size = map.disk_sectors * SECTOR;
+    let disk_size = map
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     println!("\n[raw image]");
     println!("  disk:      {} sectors", map.disk_sectors);
     println!(
@@ -1166,7 +1175,10 @@ fn dump_standard(
     if std.encrypt_mode.is_some_and(|m| m != 0) {
         return Err("encrypted images are not supported (0x106 mode != 0)".into());
     }
-    let disk_size = std.disk_sectors * SECTOR;
+    let disk_size = std
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     let volumes = standard_volumes(std);
     let (prefix, suffix) = build_partition_table(table, std.disk_sectors, &volumes)?;
     let suffix_at = if table == PartitionTable::Gpt {
@@ -1271,7 +1283,10 @@ fn dump_legacy(
 ) -> Result<(), String> {
     let plan = build_plan(map, blocks);
     let fmin = future_min(&plan);
-    let disk_size = map.disk_sectors * SECTOR;
+    let disk_size = map
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     if map.native_table && requested_table.is_some() {
         return Err(
             "this legacy image already contains a native partition table; --partition-table only selects a synthesized table and will not replace native metadata".into(),

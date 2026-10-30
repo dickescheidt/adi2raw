@@ -24,6 +24,11 @@ pub const TYPE_VOLUME_REGION: u32 = 0x109;
 const STD_HDR: usize = 0x10;
 const VDB_SIZE: usize = 0x20;
 const MAX_RECORD: usize = 1 << 20;
+// Resource ceilings for block sizes read from untrusted VDB entries. The
+// generous 16/32 MiB limits exceed current region fixtures by a wide margin
+// while preventing u32 sizes from triggering multi-gigabyte allocations.
+const MAX_VDB_UNCOMPRESSED: u32 = 16 << 20;
+const MAX_VDB_STORED: u32 = 32 << 20;
 const CHUNK: usize = 4 * 1024 * 1024;
 const OVERLAP: usize = STD_HDR - 1;
 
@@ -270,6 +275,10 @@ fn parse_region(h: StdHeader, raw: &[u8]) -> Option<Region> {
     {
         return None;
     }
+    let region_end = region
+        .block_begin_sector
+        .checked_add(region.total_sectors)?;
+    region_end.checked_mul(region.bytes_per_sector as u64)?;
     Some(region)
 }
 
@@ -277,11 +286,25 @@ fn parse_metadata(h: StdHeader, raw: &[u8]) -> Option<Metadata> {
     if h.rec_type != TYPE_VOLUME_METADATA || raw.len() < 0x28 {
         return None;
     }
+    let bytes_per_sector = u32le(raw, 0x14);
+    let partition_start_sector = u64le(raw, 0x18);
+    let partition_total_sectors = u64le(raw, 0x20);
+    let effective_bps = if (512..=4096).contains(&bytes_per_sector) {
+        bytes_per_sector as u64
+    } else {
+        512
+    };
+    let partition_end = partition_start_sector.checked_add(partition_total_sectors)?;
+    if partition_start_sector.checked_mul(effective_bps).is_none()
+        || partition_end.checked_mul(effective_bps).is_none()
+    {
+        return None;
+    }
     Some(Metadata {
         off: h.off,
-        bytes_per_sector: u32le(raw, 0x14),
-        partition_start_sector: u64le(raw, 0x18),
-        partition_total_sectors: u64le(raw, 0x20),
+        bytes_per_sector,
+        partition_start_sector,
+        partition_total_sectors,
         label: utf16le_z(raw.get(0x34..0xb0).unwrap_or(&[])),
         description: utf16le_z(raw.get(0x12a..0x170).unwrap_or(&[])),
         type_guid: guid(raw, 0x172),
@@ -297,15 +320,20 @@ fn parse_mode(h: StdHeader, raw: &[u8]) -> Option<u32> {
 }
 
 fn parse_vdb(raw: &[u8], p: usize) -> Option<VdbEntry> {
-    if p + VDB_SIZE > raw.len() {
+    if p.checked_add(VDB_SIZE)? > raw.len() {
+        return None;
+    }
+    let old_size = u32le(raw, p + 0x14);
+    let new_size = u32le(raw, p + 0x18);
+    if old_size > MAX_VDB_UNCOMPRESSED || new_size > MAX_VDB_STORED {
         return None;
     }
     Some(VdbEntry {
         reg_no: u32le(raw, p),
         block_no: u64le(raw, p + 4),
         img_offset: u64le(raw, p + 0x0c),
-        old_size: u32le(raw, p + 0x14),
-        new_size: u32le(raw, p + 0x18),
+        old_size,
+        new_size,
         crc: u32le(raw, p + 0x1c),
     })
 }
@@ -434,6 +462,12 @@ fn find_record_sets(adi: &mut Adi, full_scan: bool) -> Result<Vec<RecordSet>, St
 /// set, and at least one entry is the first block of a region. A set that
 /// fails sends the caller through the exhaustive scan, so a false negative
 /// only costs time.
+fn vdb_range_exceeds(offset: u64, length: u32, logical_end: u64) -> bool {
+    offset
+        .checked_add(length as u64)
+        .is_none_or(|range_end| range_end > logical_end)
+}
+
 fn set_is_plausible(adi: &Adi, set: &RecordSet) -> bool {
     if set.entries.is_empty() || set.regions.is_empty() {
         return false;
@@ -456,7 +490,7 @@ fn set_is_plausible(adi: &Adi, set: &RecordSet) -> bool {
         if e.old_size == 0 || e.new_size == 0 {
             return false;
         }
-        if e.img_offset.checked_add(e.new_size as u64) > Some(logical_end) {
+        if vdb_range_exceeds(e.img_offset, e.new_size, logical_end) {
             return false;
         }
         if e.block_no == 0 {
@@ -768,10 +802,34 @@ pub fn parse_standard(adi: &mut Adi, full_scan: bool) -> Result<Option<StandardI
                 skipped_regions += 1;
                 continue;
             }
-            let base = (part_start
-                .saturating_add(r.block_begin_sector)
-                .saturating_add(e.block_no.saturating_mul(r.sectors_per_region())))
-            .saturating_mul(bps);
+            let Some(block_sector) = e.block_no.checked_mul(r.sectors_per_region()) else {
+                debug_warn!("adi2raw: warn: VDB entry at logical 0x{:x}, region {}: block position overflows; skipped; output needs verification", e.img_offset, e.reg_no);
+                skipped_regions += 1;
+                continue;
+            };
+            if block_sector >= r.total_sectors {
+                debug_warn!("adi2raw: warn: VDB entry at logical 0x{:x}, region {}: block lies beyond region geometry; skipped; output needs verification", e.img_offset, e.reg_no);
+                skipped_regions += 1;
+                continue;
+            }
+            let Some(base) = part_start
+                .checked_add(r.block_begin_sector)
+                .and_then(|sector| sector.checked_add(block_sector))
+                .and_then(|sector| sector.checked_mul(bps))
+            else {
+                debug_warn!("adi2raw: warn: VDB entry at logical 0x{:x}, region {}: output position overflows; skipped; output needs verification", e.img_offset, e.reg_no);
+                skipped_regions += 1;
+                continue;
+            };
+            let Some(region_remaining) = r
+                .total_sectors
+                .checked_sub(block_sector)
+                .and_then(|sectors| sectors.checked_mul(bps))
+            else {
+                debug_warn!("adi2raw: warn: VDB entry at logical 0x{:x}, region {}: region byte range overflows; skipped; output needs verification", e.img_offset, e.reg_no);
+                skipped_regions += 1;
+                continue;
+            };
             blocks.push(StdBlock {
                 off: e.img_offset,
                 reg_no: e.reg_no,
@@ -783,10 +841,7 @@ pub fn parse_standard(adi: &mut Adi, full_scan: bool) -> Result<Option<StandardI
                 cluster: r.cluster() as u32,
                 bitmap_len: r.bitmap_len(),
                 clusters_per_block: r.clusters_per_block,
-                region_remaining: r
-                    .total_sectors
-                    .saturating_sub(e.block_no.saturating_mul(r.sectors_per_region()))
-                    .saturating_mul(bps),
+                region_remaining,
             });
             count += 1;
         }
@@ -884,6 +939,45 @@ mod tests {
     }
 
     #[test]
+    fn vdb_range_overflow_is_not_treated_as_a_plausible_range() {
+        assert!(vdb_range_exceeds(u64::MAX - 3, 8, u64::MAX));
+    }
+
+    #[test]
+    fn rejects_region_sector_range_overflow() {
+        let mut raw = vec![0u8; 0x30];
+        raw[0x14..0x1c].copy_from_slice(&(u64::MAX - 1).to_le_bytes());
+        raw[0x1c..0x24].copy_from_slice(&10u64.to_le_bytes());
+        raw[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        raw[0x28..0x2c].copy_from_slice(&1u32.to_le_bytes());
+        raw[0x2c..0x30].copy_from_slice(&512u32.to_le_bytes());
+        assert!(parse_region(
+            StdHeader {
+                off: 0,
+                rec_type: TYPE_VOLUME_REGION
+            },
+            &raw
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_metadata_sector_range_overflow() {
+        let mut raw = vec![0u8; 0x28];
+        raw[0x14..0x18].copy_from_slice(&512u32.to_le_bytes());
+        raw[0x18..0x20].copy_from_slice(&u64::MAX.to_le_bytes());
+        raw[0x20..0x28].copy_from_slice(&1u64.to_le_bytes());
+        assert!(parse_metadata(
+            StdHeader {
+                off: 0,
+                rec_type: TYPE_VOLUME_METADATA
+            },
+            &raw
+        )
+        .is_none());
+    }
+
+    #[test]
     fn standard_header_crc_is_crc32c_with_zeroed_field() {
         let r = record(TYPE_VOLUME_REGION, &[0u8; 0x30]);
         let mut check = r.clone();
@@ -914,6 +1008,14 @@ mod tests {
         assert_eq!(reg.cluster(), 32768);
         assert_eq!(reg.bitmap_len(), 1);
         assert_eq!(reg.sectors_per_region(), 512);
+    }
+
+    #[test]
+    fn rejects_vdb_entries_with_unbounded_block_sizes() {
+        let mut raw = [0u8; VDB_SIZE];
+        raw[0x14..0x18].copy_from_slice(&u32::MAX.to_le_bytes());
+        raw[0x18..0x1c].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_vdb(&raw, 0).is_none());
     }
 
     #[test]
