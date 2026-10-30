@@ -962,7 +962,6 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
     let max_region = blocks.iter().map(|b| b.region).max().unwrap_or(0);
     let stream_span = (max_region as u64 + 1) * REGION;
     let scan = scan_boot_sectors(adi, blocks)?;
-    let force_legacy = std::env::var("ADI2RAW_LEGACY_MAP").is_ok();
 
     // A boot sector's hidden_sectors is its absolute LBA. If every boot sector
     // agrees on (LBA * 512 - stream offset), the decompressed stream is a
@@ -971,14 +970,13 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
         .hits
         .first()
         .map(|h| h.lba as i128 * SECTOR as i128 - h.stream_off as i128);
-    let consistent = !force_legacy
-        && delta.is_some_and(|d| {
-            d >= 0
-                && scan
-                    .hits
-                    .iter()
-                    .all(|h| h.lba as i128 * SECTOR as i128 - h.stream_off as i128 == d)
-        });
+    let consistent = delta.is_some_and(|d| {
+        d >= 0
+            && scan
+                .hits
+                .iter()
+                .all(|h| h.lba as i128 * SECTOR as i128 - h.stream_off as i128 == d)
+    });
 
     eprintln!("adi2raw: boot sectors: {}", scan.hits.len());
     for h in &scan.hits {
@@ -1057,9 +1055,7 @@ pub fn discover_map(adi: &mut Adi, blocks: &[BlockRec]) -> Result<SectorMap> {
 
     eprintln!(
         "adi2raw: layout: legacy volume runs{}",
-        if force_legacy {
-            " (forced by ADI2RAW_LEGACY_MAP)"
-        } else if scan.hits.is_empty() {
+        if scan.hits.is_empty() {
             " (no boot sectors found)"
         } else {
             " (boot-sector origins disagree; falling back to index-run volumes)"

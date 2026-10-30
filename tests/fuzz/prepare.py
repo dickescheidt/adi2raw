@@ -46,7 +46,7 @@ for name, code in {
  }
  let path = std::env::temp_dir().join(format!("adi-rust-fuzz-{}.adi", std::process::id()));
  std::fs::write(&path, &bytes).unwrap();
- if let Ok(mut image) = adi::Adi::open_with_members(&path, &[]) { let _ = records::parse_standard(&mut image); }
+ if let Ok(mut image) = adi::Adi::open_with_members(&path, &[]) { let _ = records::parse_standard(&mut image, false); }
  let _ = std::fs::remove_file(path);'''
 }.items():
     (out / 'fuzz_targets' / (name + '.rs')).write_text('#![no_main]\n#![allow(dead_code, unused_variables)]\n' + common + '\nlibfuzzer_sys::fuzz_target!(|data: &[u8]| {\n' + code + '\n});\n')

@@ -10,7 +10,7 @@ What this checks, for both tools:
 
   * a 6 MiB image whose records sit at the end is handled by the tail scan
     (--debug says so) and produces exactly the same bytes as the forced
-    exhaustive scan (ADI*_FULL_SCAN=1);
+    exhaustive scan (--full-scan for Rust);
   * the same image with its records at the front is rejected by the tail scan
     and still found by the fallback;
   * an unreadable/absent record block still falls back instead of failing.
@@ -135,15 +135,20 @@ def build_fixture(path, blocks=24, records_at="end"):
     return path.stat().st_size
 
 
-def run(binary, kind, image, out, env_extra=None):
+def run(binary, kind, image, out, full_scan=False):
     env = dict(os.environ)
-    env.update(env_extra or {})
     if kind == "rust":
+        command = [str(binary), "--debug", "dump"]
+        if full_scan:
+            command.append("--full-scan")
+        command.append(str(image))
         with open(out, "wb") as f:
-            proc = subprocess.run([str(binary), "--debug", "dump", str(image)],
-                                  stdout=f, stderr=subprocess.PIPE, timeout=300, env=env)
+            proc = subprocess.run(command, stdout=f, stderr=subprocess.PIPE,
+                                  timeout=300, env=env)
         logs = proc.stderr.decode(errors="replace")
     else:
+        if full_scan:
+            env["ADI_EXTRACT_FULL_SCAN"] = "1"
         proc = subprocess.run([str(binary), "--debug", "reconstruct", str(image), str(out)],
                               capture_output=True, timeout=300, env=env)
         logs = proc.stdout.decode(errors="replace") + proc.stderr.decode(errors="replace")
@@ -159,10 +164,6 @@ def scan_line(logs):
     return [l for l in logs.splitlines() if "record scan:" in l]
 
 
-def full_scan_env(kind):
-    return {"ADI2RAW_FULL_SCAN": "1"} if kind == "rust" else {"ADI_EXTRACT_FULL_SCAN": "1"}
-
-
 def test_tail_scan_matches_full_scan(binary, kind, work):
     image = work / "records-at-end.adi"
     size = build_fixture(image)
@@ -174,7 +175,7 @@ def test_tail_scan_matches_full_scan(binary, kind, work):
     expect(any("one 0x201, complete set" in l for l in line),
            f"the tail scan did not handle a records-at-end image: {line}")
 
-    slow, slow_log = run(binary, kind, image, work / "slow.img", full_scan_env(kind))
+    slow, slow_log = run(binary, kind, image, work / "slow.img", full_scan=True)
     expect(slow.returncode == 0, f"forced full scan failed: {slow_log[-400:]}")
     expect(any("whole file" in l for l in scan_line(slow_log)),
            f"the full scan was not used when forced: {scan_line(slow_log)}")

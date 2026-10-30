@@ -61,7 +61,7 @@ def vdb_entries(data):
     """VDB entries of the first data-block index, with physical file offsets.
 
     The fixtures store payloads at image-set logical offset 0, so a physical
-    offset is `ImgOffset + BIFH.size`; split sets are exercised elsewhere.
+    offset is `ImgOffset + BIFH.size`.
     """
     entries = []
     for index in valid_records(data).get(0x202, []):
@@ -286,9 +286,10 @@ def test_spool_is_owner_only(binary, kind, work):
     build(image, 1, "compressed")
     spool_dir = work / "spool"
     spool_dir.mkdir(exist_ok=True)
-    env = dict(os.environ, ADI2RAW_MAX_PENDING_MB="0", ADI2RAW_SPOOL_DIR=str(spool_dir))
-    proc = subprocess.Popen([str(binary), "dump", str(image)], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, env=env)
+    proc = subprocess.Popen(
+        [str(binary), "dump", "--max-pending-mb", "0", "--spool-dir", str(spool_dir), str(image)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
     mode = None
     try:
         deadline = time.time() + 10

@@ -1,7 +1,7 @@
 //! adi2raw — two commands, no dependencies:
 //!
-//!   adi2raw info <file.adi>     describe the image
-//!   adi2raw dump <file.adi>     write a raw disk image to stdout
+//!   adi2raw info [options] <file.adi>     describe the image
+//!   adi2raw dump [options] <file.adi>     write a raw disk image to stdout
 
 // Optional format-audit diagnostics. Operational corruption warnings remain unconditional.
 static DEBUG_DIAGNOSTICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -17,6 +17,7 @@ mod adi;
 mod crc;
 mod gpt;
 mod lz4;
+mod mbr;
 mod records;
 
 use std::collections::BTreeMap;
@@ -47,9 +48,9 @@ struct Spool {
 }
 
 impl Spool {
-    fn create() -> Result<Self, String> {
-        let dir = env::var_os("ADI2RAW_SPOOL_DIR")
-            .map(PathBuf::from)
+    fn create(spool_dir: Option<&Path>) -> Result<Self, String> {
+        let dir = spool_dir
+            .map(Path::to_path_buf)
             .unwrap_or_else(env::temp_dir);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -98,18 +99,22 @@ struct Streamer<W: Write> {
     pending: BTreeMap<u64, Vec<u8>>,
     spool: Option<Spool>,
     max_pending: usize,
+    spool_dir: Option<PathBuf>,
+    no_spool: bool,
     pub broken: bool,
     pub total: u64,
 }
 
 impl<W: Write> Streamer<W> {
-    fn new(out: W, max_pending: usize) -> Self {
+    fn new(out: W, max_pending: usize, spool_dir: Option<PathBuf>, no_spool: bool) -> Self {
         Self {
             out,
             pos: 0,
             pending: BTreeMap::new(),
             spool: None,
             max_pending,
+            spool_dir,
+            no_spool,
             broken: false,
             total: 0,
         }
@@ -201,10 +206,10 @@ impl<W: Write> Streamer<W> {
 
         let buffered: usize = self.pending.values().map(|v| v.len()).sum();
         if buffered > self.max_pending {
-            if env::var_os("ADI2RAW_NO_SPOOL").is_some() {
+            if self.no_spool {
                 return Err(format!(
                     "image blocks are too far out of disk order to stream ({} MiB buffered); \
-                     spooling disabled by ADI2RAW_NO_SPOOL",
+                     spooling disabled by --no-spool",
                     buffered / 1024 / 1024
                 ));
             }
@@ -217,10 +222,10 @@ impl<W: Write> Streamer<W> {
     /// Everything already emitted to stdout stays emitted; the spool only
     /// holds unflushed writes, all of which start at or after `self.pos`.
     fn spill(&mut self) -> Result<(), String> {
-        let mut spool = Spool::create()?;
+        let mut spool = Spool::create(self.spool_dir.as_deref())?;
         eprintln!(
             "adi2raw: blocks are far out of disk order; spooling to {} \
-             (set ADI2RAW_SPOOL_DIR to choose a location)",
+             (use --spool-dir to choose a location)",
             spool.path.display()
         );
         for (off, data) in &self.pending {
@@ -532,27 +537,22 @@ struct Opened {
     kind: ImageMap,
 }
 
-fn open_image(path: &Path) -> Result<Opened, String> {
-    let extra = records::extra_member_paths("ADI2RAW_MEMBERS");
-    let mut adi = Adi::open_with_members(path, &extra)?;
+fn open_image(path: &Path, full_scan: bool) -> Result<Opened, String> {
+    let mut adi = Adi::open_with_members(path, &[])?;
     debug_warn!("adi2raw: warn: disk extent/layout is inferred and GPT may be reconstructed, not an exact original-disk restore; block checksums do not verify placement; verify layout and filesystem before use");
-    if env::var_os("ADI2RAW_LEGACY_ONLY").is_none() {
-        if let Some(std) = records::parse_standard(&mut adi)? {
-            eprintln!(
-                "adi2raw: standard record path: {} volume set(s), {} VDB entries, {} member(s)",
-                std.sets.len(),
-                std.blocks.len(),
-                adi.image_set.info().len()
-            );
-            return Ok(Opened {
-                adi,
-                kind: ImageMap::Standard(std),
-            });
-        }
-        eprintln!("adi2raw: no standard record sets; using legacy signature scan");
-    } else {
-        eprintln!("adi2raw: legacy signature scan forced by ADI2RAW_LEGACY_ONLY");
+    if let Some(std) = records::parse_standard(&mut adi, full_scan)? {
+        eprintln!(
+            "adi2raw: standard record path: {} volume set(s), {} VDB entries, {} member(s)",
+            std.sets.len(),
+            std.blocks.len(),
+            adi.image_set.info().len()
+        );
+        return Ok(Opened {
+            adi,
+            kind: ImageMap::Standard(std),
+        });
     }
+    eprintln!("adi2raw: no standard record sets; using legacy signature scan");
     debug_warn!("adi2raw: warn: legacy signature scan uses inferred geometry and placement; output needs further verification");
     let blocks = scan_block_index(&mut adi)?;
     if blocks.is_empty() {
@@ -740,9 +740,9 @@ fn standard_writes(
         .collect())
 }
 
-fn cmd_info(path: &Path) -> Result<(), String> {
+fn cmd_info(path: &Path, options: &Options) -> Result<(), String> {
     debug_warn!("adi2raw: warn: info verifies a sample of decoded blocks; use dump for a full check of every block");
-    let mut opened = open_image(path)?;
+    let mut opened = open_image(path, options.full_scan)?;
     opened.adi.print_info();
     match &opened.kind {
         ImageMap::Standard(std) => standard_info(&mut opened.adi, std),
@@ -1013,28 +1013,83 @@ fn legacy_info(_adi: &Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(), S
     Ok(())
 }
 
-fn cmd_dump(path: &Path) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PartitionTable {
+    Mbr,
+    Gpt,
+}
+
+struct Options {
+    partition_table: Option<PartitionTable>,
+    spool_dir: Option<PathBuf>,
+    max_pending: Option<usize>,
+    no_spool: bool,
+    full_scan: bool,
+}
+
+fn build_partition_table(
+    style: PartitionTable,
+    disk_sectors: u64,
+    volumes: &[Volume],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    match style {
+        PartitionTable::Gpt => Ok(gpt::build(disk_sectors, volumes)),
+        PartitionTable::Mbr => Ok((mbr::build(disk_sectors, volumes)?, Vec::new())),
+    }
+}
+
+fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
     if io::stdout().is_terminal() {
         return Err(
             "refusing to write a raw disk image to a terminal; redirect to a file or pipe to dd"
                 .into(),
         );
     }
-    let opened = open_image(path)?;
+    let opened = open_image(path, options.full_scan)?;
     match opened.kind {
-        ImageMap::Standard(std) => dump_standard(opened.adi, &std),
-        ImageMap::Legacy { blocks, map } => dump_legacy(opened.adi, &blocks, &map),
+        ImageMap::Standard(std) => dump_standard(
+            opened.adi,
+            &std,
+            options.partition_table.unwrap_or(PartitionTable::Gpt),
+            options.spool_dir.clone(),
+            options.max_pending.unwrap_or(MAX_PENDING),
+            options.no_spool,
+        ),
+        ImageMap::Legacy { blocks, map } => {
+            // Native tables are preserved; dump_legacy rejects an explicit
+            // partition-table choice rather than silently replacing metadata.
+            dump_legacy(
+                opened.adi,
+                &blocks,
+                &map,
+                options.partition_table,
+                options.spool_dir.clone(),
+                options.max_pending.unwrap_or(MAX_PENDING),
+                options.no_spool,
+            )
+        }
     }
 }
 
-fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), String> {
+fn dump_standard(
+    mut adi: Adi,
+    std: &records::StandardImage,
+    table: PartitionTable,
+    spool_dir: Option<PathBuf>,
+    max_pending: usize,
+    no_spool: bool,
+) -> Result<(), String> {
     if std.encrypt_mode.is_some_and(|m| m != 0) {
         return Err("encrypted images are not supported (0x106 mode != 0)".into());
     }
     let disk_size = std.disk_sectors * SECTOR;
     let volumes = standard_volumes(std);
-    let (prefix, suffix) = gpt::build(std.disk_sectors, &volumes);
-    let suffix_at = gpt::suffix_start(std.disk_sectors);
+    let (prefix, suffix) = build_partition_table(table, std.disk_sectors, &volumes)?;
+    let suffix_at = if table == PartitionTable::Gpt {
+        gpt::suffix_start(std.disk_sectors)
+    } else {
+        0
+    };
     let plan: Plan = std
         .blocks
         .iter()
@@ -1053,15 +1108,12 @@ fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), Strin
         volumes.len(),
         std.blocks.len()
     );
-    let max_pending = env::var("ADI2RAW_MAX_PENDING_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb.saturating_mul(1024 * 1024))
-        .unwrap_or(MAX_PENDING);
     let stdout = io::stdout();
     let mut st = Streamer::new(
         BufWriter::with_capacity(1024 * 1024, stdout.lock()),
         max_pending,
+        spool_dir,
+        no_spool,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1112,16 +1164,35 @@ fn dump_standard(mut adi: Adi, std: &records::StandardImage) -> Result<(), Strin
     Ok(())
 }
 
-fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(), String> {
+fn dump_legacy(
+    mut adi: Adi,
+    blocks: &[BlockRec],
+    map: &SectorMap,
+    requested_table: Option<PartitionTable>,
+    spool_dir: Option<PathBuf>,
+    max_pending: usize,
+    no_spool: bool,
+) -> Result<(), String> {
     let plan = build_plan(map, blocks);
     let fmin = future_min(&plan);
     let disk_size = map.disk_sectors * SECTOR;
-    let (prefix, suffix) = if map.native_table {
-        (Vec::new(), Vec::new())
+    if map.native_table && requested_table.is_some() {
+        return Err(
+            "this legacy image already contains a native partition table; --partition-table only selects a synthesized table and will not replace native metadata".into(),
+        );
+    }
+    let (prefix, suffix, suffix_at) = if map.native_table {
+        (Vec::new(), Vec::new(), 0)
     } else {
-        gpt::build(map.disk_sectors, &map.volumes)
+        let table = requested_table.unwrap_or(PartitionTable::Gpt);
+        let (prefix, suffix) = build_partition_table(table, map.disk_sectors, &map.volumes)?;
+        let suffix_at = if table == PartitionTable::Gpt {
+            gpt::suffix_start(map.disk_sectors)
+        } else {
+            0
+        };
+        (prefix, suffix, suffix_at)
     };
-    let suffix_at = gpt::suffix_start(map.disk_sectors);
 
     let ps = plan_stats(&plan, blocks);
     eprintln!(
@@ -1138,15 +1209,12 @@ fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(),
         ps.reorder_need / 1024 / 1024
     );
 
-    let max_pending = env::var("ADI2RAW_MAX_PENDING_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|mb| mb.saturating_mul(1024 * 1024))
-        .unwrap_or(MAX_PENDING);
     let stdout = io::stdout();
     let mut st = Streamer::new(
         BufWriter::with_capacity(1024 * 1024, stdout.lock()),
         max_pending,
+        spool_dir,
+        no_spool,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1210,37 +1278,115 @@ fn dump_legacy(mut adi: Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(),
 
 fn usage() -> String {
     format!(
-        "adi2raw {} — stream an AOMEI Backupper .adi image as a raw disk image\n\n\
+        "adi2raw {} — convert an AOMEI .adi disk image to raw output\n\n\
          Usage:\n  \
-         adi2raw info <file.adi>     show header, block index and volume map\n  \
-         adi2raw dump <file.adi>     write the raw disk image to stdout\n\n\
+         adi2raw info [options] <file.adi>\n  \
+         adi2raw dump [options] <file.adi>\n\n\
+         Options:\n  \
+         -p, --partition-table mbr|gpt  Select the synthetic table (default: gpt)\n  \
+         --spool-dir DIR                Temporary-file location (default: {})\n  \
+         --max-pending-mb N             Memory buffer before spooling (default: 256)\n  \
+         --no-spool                     Fail instead of using a temporary file\n  \
+         --full-scan                    Search the entire file for records\n  \
+         --debug                        Show additional diagnostics\n  \
+         -h, --help                     Show this help\n\n\
          Examples:\n  \
-         adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress\n  \
          adi2raw dump backup.adi > disk.img\n  \
-         adi2raw dump backup.adi | sha256sum\n\n\
-         --debug enables extended format-audit diagnostics on stderr.\n\
-         Diagnostics go to stderr; stdout carries only raw bytes.\n\
-         Alias for dump: raw.\n\
-         Standard 0x201/0x202/0x109 records are used when present.\n\
-         Split image sets: ADI2RAW_MEMBERS=member1.adi:member2.adi\n\
-         Set ADI2RAW_LEGACY_ONLY=1 to force the signature-scan parser.\n\
-         Set ADI2RAW_LEGACY_MAP=1 to force the old volume-run layout.\n\
-         Out-of-order images spill to a sparse temp file; see ADI2RAW_SPOOL_DIR.",
-        env!("CARGO_PKG_VERSION")
+         adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress",
+        env!("CARGO_PKG_VERSION"),
+        env::temp_dir().display()
     )
 }
 
+fn parse_partition_table(value: &str) -> Result<PartitionTable, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "mbr" => Ok(PartitionTable::Mbr),
+        "gpt" => Ok(PartitionTable::Gpt),
+        _ => Err(format!(
+            "invalid partition table {value:?}; expected mbr or gpt"
+        )),
+    }
+}
+
+fn parse_pending_limit(value: &str) -> Result<usize, String> {
+    let mb = value.parse::<usize>().map_err(|_| {
+        format!("invalid --max-pending-mb value {value:?}; expected a non-negative integer")
+    })?;
+    Ok(mb.saturating_mul(1024 * 1024))
+}
+
 fn main() -> ExitCode {
-    let mut args = Vec::new();
-    let mut options = true;
-    for (i, arg) in env::args().enumerate() {
-        if i != 0 && options && arg == "--" {
-            options = false;
-        } else if i != 0 && options && arg == "--debug" {
+    let mut args = vec![env::args().next().unwrap_or_else(|| "adi2raw".into())];
+    let mut options = Options {
+        partition_table: None,
+        spool_dir: None,
+        max_pending: None,
+        no_spool: false,
+        full_scan: false,
+    };
+    let mut parse_error = None;
+    let mut it = env::args().skip(1);
+    let mut parsing_options = true;
+    while let Some(arg) = it.next() {
+        if parsing_options && arg == "--" {
+            parsing_options = false;
+        } else if parsing_options && arg == "--debug" {
             DEBUG_DIAGNOSTICS.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if parsing_options && arg == "--full-scan" {
+            options.full_scan = true;
+        } else if parsing_options && arg == "--no-spool" {
+            options.no_spool = true;
+        } else if parsing_options && (arg == "-p" || arg == "--partition-table") {
+            match it.next() {
+                Some(value) => match parse_partition_table(&value) {
+                    Ok(style) => options.partition_table = Some(style),
+                    Err(e) => parse_error = Some(e),
+                },
+                None => parse_error = Some(format!("{arg} requires mbr or gpt")),
+            }
+        } else if parsing_options && arg.starts_with("--partition-table=") {
+            let value = arg.strip_prefix("--partition-table=").unwrap();
+            match parse_partition_table(value) {
+                Ok(style) => options.partition_table = Some(style),
+                Err(e) => parse_error = Some(e),
+            }
+        } else if parsing_options && arg == "--spool-dir" {
+            match it.next() {
+                Some(dir) if !dir.starts_with('-') => options.spool_dir = Some(PathBuf::from(dir)),
+                Some(_) => parse_error = Some("--spool-dir requires a directory".into()),
+                None => parse_error = Some("--spool-dir requires a directory".into()),
+            }
+        } else if parsing_options && arg.starts_with("--spool-dir=") {
+            let dir = arg.strip_prefix("--spool-dir=").unwrap();
+            if dir.is_empty() {
+                parse_error = Some("--spool-dir requires a directory".into());
+            } else {
+                options.spool_dir = Some(PathBuf::from(dir));
+            }
+        } else if parsing_options && arg == "--max-pending-mb" {
+            match it.next() {
+                Some(value) => match parse_pending_limit(&value) {
+                    Ok(limit) => options.max_pending = Some(limit),
+                    Err(e) => parse_error = Some(e),
+                },
+                None => parse_error = Some("--max-pending-mb requires a number".into()),
+            }
+        } else if parsing_options && arg.starts_with("--max-pending-mb=") {
+            let value = arg.strip_prefix("--max-pending-mb=").unwrap();
+            match parse_pending_limit(value) {
+                Ok(limit) => options.max_pending = Some(limit),
+                Err(e) => parse_error = Some(e),
+            }
         } else {
             args.push(arg);
         }
+    }
+    if parse_error.is_none() && options.no_spool && options.spool_dir.is_some() {
+        parse_error = Some("--no-spool cannot be combined with --spool-dir".into());
+    }
+    if let Some(e) = parse_error {
+        eprintln!("adi2raw: error: {e}\n\n{}", usage());
+        return ExitCode::from(2);
     }
     let result = match (args.get(1).map(String::as_str), args.len()) {
         (Some("-h" | "--help" | "help"), _) => {
@@ -1251,8 +1397,18 @@ fn main() -> ExitCode {
             println!("adi2raw {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        (Some("info"), 3) => cmd_info(Path::new(&args[2])),
-        (Some("dump" | "raw"), 3) => cmd_dump(Path::new(&args[2])),
+        (Some("info"), 3)
+            if options.partition_table.is_none()
+                && options.spool_dir.is_none()
+                && options.max_pending.is_none()
+                && !options.no_spool =>
+        {
+            cmd_info(Path::new(&args[2]), &options)
+        }
+        (Some("info"), 3) => {
+            Err("partition-table and dump buffering options only apply to dump".into())
+        }
+        (Some("dump"), 3) => cmd_dump(Path::new(&args[2]), &options),
         _ => {
             eprintln!("{}\n", usage());
             return ExitCode::from(2);
@@ -1282,7 +1438,7 @@ mod tests {
     fn later_write_inside_pending_range_keeps_the_tail() {
         // The second write starts inside the first one and ends before it, which
         // used to drop the first write's 85-byte tail and zero-fill that range.
-        let mut st = Streamer::new(Vec::new(), 1 << 20);
+        let mut st = Streamer::new(Vec::new(), 1 << 20, None, false);
         st.add(0, vec![b'A'; 100]).unwrap();
         st.add(10, vec![b'B'; 5]).unwrap();
         st.finish(100).unwrap();
@@ -1294,7 +1450,7 @@ mod tests {
 
     #[test]
     fn write_fully_inside_pending_range_splits_it() {
-        let mut st = Streamer::new(Vec::new(), 1 << 20);
+        let mut st = Streamer::new(Vec::new(), 1 << 20, None, false);
         st.add(0, vec![b'A'; 100]).unwrap();
         st.add(40, vec![b'B'; 20]).unwrap();
         st.finish(100).unwrap();
@@ -1305,7 +1461,7 @@ mod tests {
 
     #[test]
     fn a_queued_write_at_the_new_end_is_not_overwritten() {
-        let mut st = Streamer::new(Vec::new(), 1 << 20);
+        let mut st = Streamer::new(Vec::new(), 1 << 20, None, false);
         st.add(0, vec![b'A'; 100]).unwrap();
         st.add(200, vec![b'C'; 10]).unwrap();
         st.add(50, vec![b'B'; 150]).unwrap();

@@ -20,6 +20,12 @@ python3 tests/make_gap_regions_adi.py "$TMP/gaps.adi"
 python3 tests/make_standard_adi.py "$TMP/standard.adi" single
 python3 tests/make_standard_adi.py "$TMP/split.adi" split
 
+"$BIN" --help > "$TMP/help.txt"
+grep -q -- "--max-pending-mb N" "$TMP/help.txt"
+grep -q -- "--no-spool" "$TMP/help.txt"
+grep -q -- "--full-scan" "$TMP/help.txt"
+grep -q -- "default:" "$TMP/help.txt"
+
 echo "== info =="
 "$BIN" info "$TMP/simple.adi" | grep "blocks in disk order: yes" > /dev/null
 "$BIN" info "$TMP/multi.adi" | grep "blocks in disk order: no" > /dev/null
@@ -75,11 +81,14 @@ echo "big clusters: OK"
 
 echo "== out-of-order blocks: sparse spool fallback =="
 # A large cap keeps everything in RAM; a 1 MiB cap forces the spool path.
-ADI2RAW_MAX_PENDING_MB=64 "$BIN" dump "$TMP/ooo.adi" > "$TMP/ooo-mem.img" 2> "$TMP/ooo-mem.err"
+"$BIN" dump --max-pending-mb 64 "$TMP/ooo.adi" > "$TMP/ooo-mem.img" 2> "$TMP/ooo-mem.err"
 ! grep -qi "spooling" "$TMP/ooo-mem.err"
-ADI2RAW_MAX_PENDING_MB=1 ADI2RAW_SPOOL_DIR="$TMP" \
-    "$BIN" dump "$TMP/ooo.adi" > "$TMP/ooo-spool.img" 2> "$TMP/ooo-spool.err"
+"$BIN" dump --max-pending-mb 1 --spool-dir "$TMP" "$TMP/ooo.adi" > "$TMP/ooo-spool.img" 2> "$TMP/ooo-spool.err"
 grep -q "spooling to" "$TMP/ooo-spool.err"
+if "$BIN" dump --max-pending-mb 1 --no-spool "$TMP/ooo.adi" > /dev/null 2> "$TMP/no-spool.err"; then
+    echo "--no-spool did not reject an out-of-order image"; exit 1
+fi
+grep -q "spooling disabled by --no-spool" "$TMP/no-spool.err"
 cmp "$TMP/ooo-mem.img" "$TMP/ooo-spool.img"
 python3 tests/check_out_of_order.py "$TMP/ooo-spool.img" 3163648
 [[ -z "$(find "$TMP" -name '*.spool' -print -quit)" ]] || {
@@ -104,23 +113,30 @@ grep -q "BRCrc32 valid" "$TMP/standard.info"
 "$BIN" dump "$TMP/standard.adi" > "$TMP/standard.img" 2> "$TMP/standard.err"
 grep -q "2 decoded blocks checked, 0 mismatches" "$TMP/standard.err"
 python3 tests/check_standard.py "$TMP/standard.img" 3163136
+"$BIN" dump "$TMP/standard.adi" --partition-table mbr > "$TMP/standard-mbr.img" 2> "$TMP/standard-mbr.err"
+"$BIN" dump "$TMP/standard.adi" --partition-table=gpt > "$TMP/standard-gpt.img" 2> "$TMP/standard-gpt.err"
+"$BIN" dump "$TMP/multipart.adi" -p mbr > "$TMP/multipart-mbr.img" 2> "$TMP/multipart-mbr.err"
+python3 tests/check_partition_tables.py "$TMP/standard-mbr.img" "$TMP/standard-gpt.img" "$TMP/standard.img" "$TMP/multipart-mbr.img"
+if "$BIN" dump "$TMP/standard.adi" --partition-table invalid > /dev/null 2> "$TMP/invalid-pt.err"; then
+    echo "invalid partition-table value was accepted"; exit 1
+fi
+grep -q "expected mbr or gpt" "$TMP/invalid-pt.err"
+if "$BIN" dump --max-pending-mb invalid "$TMP/standard.adi" > /dev/null 2> "$TMP/invalid-pending.err"; then
+    echo "invalid --max-pending-mb value was accepted"; exit 1
+fi
+grep -q "invalid --max-pending-mb value" "$TMP/invalid-pending.err"
+if "$BIN" dump --no-spool --spool-dir "$TMP" "$TMP/standard.adi" > /dev/null 2> "$TMP/conflicting-spool.err"; then
+    echo "--no-spool and --spool-dir were accepted together"; exit 1
+fi
+grep -q "cannot be combined" "$TMP/conflicting-spool.err"
 echo "standard records: OK"
 
-echo "== image-set member offset translation (split set) =="
-MEMBER="$TMP/split.adi.member1.adi"
-ADI2RAW_MEMBERS="$MEMBER" "$BIN" info "$TMP/split.adi" > "$TMP/split.info" 2> "$TMP/split.info.err"
-grep -q "2 member(s)" "$TMP/split.info.err"
-grep -q "logical 0x20700..0x30800" "$TMP/split.info"
-ADI2RAW_MEMBERS="$MEMBER" "$BIN" dump "$TMP/split.adi" > "$TMP/split.img" 2> "$TMP/split.err"
-grep -q "2 decoded blocks checked, 0 mismatches" "$TMP/split.err"
-python3 tests/check_standard.py "$TMP/split.img" 3163136
-cmp "$TMP/standard.img" "$TMP/split.img"
-# Without the extra member, the second block cannot be read: fail loudly.
-if ADI2RAW_NO_SPOOL=1 "$BIN" dump "$TMP/split.adi" > /dev/null 2> "$TMP/missing.err"; then
-    echo "missing image-set member was not detected"; exit 1
+echo "== split image set without external-member interface =="
+if "$BIN" dump "$TMP/split.adi" > /dev/null 2> "$TMP/missing.err"; then
+    echo "split image set unexpectedly succeeded without all member files"; exit 1
 fi
 grep -q "not covered by any member" "$TMP/missing.err"
-echo "split image set: OK"
+echo "split image set rejected clearly: OK"
 
 echo "== broken pipe =="
 set +e
@@ -147,10 +163,6 @@ if [[ -n "${ADI_EXTRACT:-}" && -x "$ADI_EXTRACT" ]]; then
         cmp "$TMP/cpp-$kind.img" "$TMP/$kind.img"
         echo "$kind: byte-identical to C++ output"
     done
-    ADI_EXTRACT_MEMBERS="$TMP/split.adi.member1.adi" \
-        "$ADI_EXTRACT" reconstruct "$TMP/split.adi" "$TMP/cpp-split.img" > /dev/null 2>&1
-    cmp "$TMP/cpp-split.img" "$TMP/split.img"
-    echo "split: byte-identical to C++ output"
 else
     echo "tip: ADI_EXTRACT=/path/to/adi-extract $0 also compares against the C++ tool"
 fi

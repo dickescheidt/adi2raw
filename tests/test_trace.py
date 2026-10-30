@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Validate opt-in, payload-free placement traces, including cross-member reads."""
+"""Validate opt-in, payload-free placement traces for a single-file image."""
 from pathlib import Path
 import re
-import struct
 import sys
 import tempfile
-from make_standard_adi import BIFH_SIZE, BIFT_SIZE
+from make_standard_adi import BIFH_SIZE
 from test_properties import build, model, run, BPS, START
 
 binary = Path(sys.argv[1]).resolve()
@@ -14,9 +13,9 @@ with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
     path = tmp / 'private-backup-name.adi'
     output = tmp / 'out.img'
-    expected, extra = build(path, 0, 'split')
+    expected, _ = build(path, 0, 'compressed')
     cpb, spc, begin, sectors, _, blocks, _ = model(0)
-    proc = run(binary, kind, path, output, extra, debug=True)
+    proc = run(binary, kind, path, output, debug=True)
     assert proc.returncode == 0, proc.stderr
     image = output.read_bytes()
     lines = [line for line in proc.stderr.decode().splitlines() if 'trace:' in line]
@@ -27,11 +26,9 @@ with tempfile.TemporaryDirectory() as tmp:
         assert int(reg) == 0
         assert int(base, 16) == (START + begin + int(block) * cpb * spc) * BPS
     reads = re.findall(r'read member=(\d+) logical=0x([0-9a-f]+) physical=0x([0-9a-f]+) bytes=(\d+)', '\n'.join(lines))
-    cut = struct.unpack_from('<Q', path.read_bytes(), path.stat().st_size - BIFT_SIZE + 0x620)[0]
-    assert {int(m) for m, *_ in reads} == {0, 1}, reads
-    for member, logical, physical, length in reads:
-        start = 0 if int(member) == 0 else cut
-        assert int(physical, 16) == BIFH_SIZE + int(logical, 16) - start
+    assert {int(m) for m, *_ in reads} == {0}, reads
+    for _, logical, physical, length in reads:
+        assert int(physical, 16) == BIFH_SIZE + int(logical, 16)
         assert int(length) > 0
     writes = re.findall(r'write logical=0x[0-9a-f]+ decoded_offset=\d+ output=0x([0-9a-f]+) bytes=(\d+)', '\n'.join(lines))
     assert writes
@@ -42,7 +39,7 @@ with tempfile.TemporaryDirectory() as tmp:
     checksums = re.findall(r'crc_actual=0x([0-9a-f]+) crc_expected=0x([0-9a-f]+)', '\n'.join(lines))
     assert len(checksums) == len(blocks) and all(int(a, 16) == int(b, 16) for a, b in checksums)
     assert any('trace: bitmap ' in line for line in lines)
-    quiet = run(binary, kind, path, output, extra, debug=False)
+    quiet = run(binary, kind, path, output, debug=False)
     assert quiet.returncode == 0 and b'trace:' not in quiet.stderr
     assert image == output.read_bytes(), 'trace changed recovered bytes'
-    print('TRACE PASSED: VDB identity, split-member translation, CRCs, bitmap and bounded writes')
+    print('TRACE PASSED: VDB identity, logical offsets, CRCs, bitmap and bounded writes')

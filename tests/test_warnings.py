@@ -115,37 +115,38 @@ with tempfile.TemporaryDirectory() as tmp:
                 assert wanted not in quiet.stderr.lower(), (case, 'extended message leaked without --debug', quiet.stderr)
         print(case + ': opt-in diagnostics / identical output OK')
 
-# Checksums of extra members must not go unchecked just because the primary is valid.
-with tempfile.TemporaryDirectory() as tmp:
-    image = pathlib.Path(tmp) / 'split.adi'
-    subprocess.run([sys.executable, str(HERE / 'make_standard_adi.py'), str(image), 'split'], check=True, stdout=subprocess.DEVNULL)
-    member = pathlib.Path(str(image) + '.member1.adi')
-    data = bytearray(member.read_bytes())
-    data[8] ^= 1
-    member.write_bytes(data)
-    import os
-    env = dict(os.environ)
-    env['ADI2RAW_MEMBERS' if RUST else 'ADI_EXTRACT_MEMBERS'] = str(member)
-    proc = subprocess.run([BINARY, '--debug', 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.returncode == 0, proc.stderr
-    assert member.name.encode() in proc.stderr and b'checksum' in proc.stderr, proc.stderr
-    quiet = subprocess.run([BINARY, 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert b'checksum' not in quiet.stderr.lower(), quiet.stderr
-    print('extra-member-checksum: opt-in diagnostics OK')
-    # An invalid logical range is visible even when info does not read that payload.
-    put32(data, 8, u32(data, 8) ^ 1)
-    tail = len(data) - BIFT_SIZE
-    logical = struct.unpack_from('<Q', data, tail + 0x628)[0]
-    struct.pack_into('<Q', data, tail + 0x628, logical + 512)
-    put32(data, len(data) - 12, 0)
-    put32(data, len(data) - 12, br_crc32(bytes(data[tail:])))
-    member.write_bytes(data)
-    proc = subprocess.run([BINARY, '--debug', 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.returncode == 0, proc.stderr
-    assert b'gap or overlap' in proc.stderr, proc.stderr
-    quiet = subprocess.run([BINARY, 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert b'gap or overlap' not in quiet.stderr, quiet.stderr
-    print('member-gap: opt-in diagnostics OK')
+if not RUST:
+    # Checksums of extra members must not go unchecked just because the primary is valid.
+    with tempfile.TemporaryDirectory() as tmp:
+        image = pathlib.Path(tmp) / 'split.adi'
+        subprocess.run([sys.executable, str(HERE / 'make_standard_adi.py'), str(image), 'split'], check=True, stdout=subprocess.DEVNULL)
+        member = pathlib.Path(str(image) + '.member1.adi')
+        data = bytearray(member.read_bytes())
+        data[8] ^= 1
+        member.write_bytes(data)
+        import os
+        env = dict(os.environ)
+        env['ADI_EXTRACT_MEMBERS'] = str(member)
+        proc = subprocess.run([BINARY, '--debug', 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.returncode == 0, proc.stderr
+        assert member.name.encode() in proc.stderr and b'checksum' in proc.stderr, proc.stderr
+        quiet = subprocess.run([BINARY, 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert b'checksum' not in quiet.stderr.lower(), quiet.stderr
+        print('extra-member-checksum: opt-in diagnostics OK')
+        # An invalid logical range is visible even when info does not read that payload.
+        put32(data, 8, u32(data, 8) ^ 1)
+        tail = len(data) - BIFT_SIZE
+        logical = struct.unpack_from('<Q', data, tail + 0x628)[0]
+        struct.pack_into('<Q', data, tail + 0x628, logical + 512)
+        put32(data, len(data) - 12, 0)
+        put32(data, len(data) - 12, br_crc32(bytes(data[tail:])))
+        member.write_bytes(data)
+        proc = subprocess.run([BINARY, '--debug', 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.returncode == 0, proc.stderr
+        assert b'gap or overlap' in proc.stderr, proc.stderr
+        quiet = subprocess.run([BINARY, 'info', str(image)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert b'gap or overlap' not in quiet.stderr, quiet.stderr
+        print('member-gap: opt-in diagnostics OK')
 
 # Global option positions and literal --debug filename after the option terminator.
 with tempfile.TemporaryDirectory() as tmp:

@@ -9,7 +9,6 @@
 //! callers fall back to the legacy scanner.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 
 use crate::adi::{parse_boot_sector, u32le, u64le, utf16le_z, Adi};
 use crate::crc::br_crc32;
@@ -392,14 +391,14 @@ fn shifted(offset: u64, delta: i64) -> Option<u64> {
 /// Discover CRC-valid volume record sets. This is the same relationship the
 /// independent implementation uses: a 0x201's 0x202 directory entry points at
 /// the *end* of the VDB table, and the matching 0x202 header fixes the delta.
-fn find_record_sets(adi: &mut Adi) -> Result<Vec<RecordSet>, String> {
+fn find_record_sets(adi: &mut Adi, full_scan: bool) -> Result<Vec<RecordSet>, String> {
     // Reading the whole file to find a record block that is normally in the
     // last few kilobytes costs a full pass over the image (70 s for 70 GiB at
     // 1 GB/s) before the first output byte. Search the tail first and accept it
     // only when it yields exactly one complete, self-consistent record set;
     // otherwise fall back to the exhaustive scan, which is what older images
-    // and unusual layouts get. ADI2RAW_FULL_SCAN=1 forces the exhaustive scan.
-    if std::env::var_os("ADI2RAW_FULL_SCAN").is_none() && adi.file_size > TAIL_WINDOW {
+    // and unusual layouts get. `full_scan` forces that exhaustive path.
+    if !full_scan && adi.file_size > TAIL_WINDOW {
         let from = adi.file_size - TAIL_WINDOW;
         let headers = scan_headers_range(adi, from, adi.file_size)?;
         let indexes = headers
@@ -671,8 +670,8 @@ fn probe_volume_boot(adi: &mut Adi, blocks: &[StdBlock], volume_start: u64) -> O
 
 /// Parse the standard record path. Returns `None` when the image has no
 /// CRC-valid volume record sets (synthetic fixtures, older generations).
-pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
-    let sets = find_record_sets(adi)?;
+pub fn parse_standard(adi: &mut Adi, full_scan: bool) -> Result<Option<StandardImage>, String> {
+    let sets = find_record_sets(adi, full_scan)?;
     if sets.is_empty() {
         return Ok(None);
     }
@@ -866,17 +865,6 @@ pub fn parse_standard(adi: &mut Adi) -> Result<Option<StandardImage>, String> {
         encrypt_mode,
         skipped_regions,
     }))
-}
-
-pub fn extra_member_paths(var: &str) -> Vec<PathBuf> {
-    let Some(raw) = std::env::var_os(var) else {
-        return Vec::new();
-    };
-    raw.to_string_lossy()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .collect()
 }
 
 #[cfg(test)]

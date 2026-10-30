@@ -165,10 +165,9 @@ def build(path, seed, variant):
 
 def run(binary, kind, path, output, extra=None, debug=False, timeout=10):
     env = dict(os.environ)
-    env.pop('ADI2RAW_MEMBERS', None)
     env.pop('ADI_EXTRACT_MEMBERS', None)
-    if extra:
-        env['ADI2RAW_MEMBERS' if kind == 'rust' else 'ADI_EXTRACT_MEMBERS'] = str(extra)
+    if extra and kind == 'cpp':
+        env['ADI_EXTRACT_MEMBERS'] = str(extra)
     args = [str(binary)] + (['--debug'] if debug else []) + ['dump' if kind == 'rust' else 'reconstruct', str(path)]
     if kind != 'rust':
         args.append(str(output))
@@ -187,9 +186,12 @@ def main():
     count = 0
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
+        variants = ('plain', 'literals', 'compressed', 'padded', 'grouped')
+        if args.kind == 'cpp':
+            variants += ('split',)
         for seed in range(args.seeds):
             baseline = None
-            for variant in ('plain', 'literals', 'compressed', 'padded', 'grouped', 'split'):
+            for variant in variants:
                 path = tmp / f'{seed}-{variant}.adi'
                 output = tmp / 'out.img'
                 expected, extra = build(path, seed, variant)
