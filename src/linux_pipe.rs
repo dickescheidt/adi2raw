@@ -12,7 +12,9 @@ use std::io;
 use std::os::raw::{c_int, c_uint, c_void};
 use std::ptr::NonNull;
 
+const F_SETPIPE_SZ: c_int = 1031;
 const F_GETPIPE_SZ: c_int = 1032;
+const TARGET_PIPE_CAPACITY: usize = 128 * 1024;
 const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
 
 #[repr(C)]
@@ -79,11 +81,25 @@ impl VmspliceWriter {
     /// outside the range supported by this bounded fast path.
     pub(crate) fn for_fd(fd: c_int) -> io::Result<Option<Self>> {
         // SAFETY: F_GETPIPE_SZ takes no third argument and does not retain fd.
-        let capacity = unsafe { fcntl(fd, F_GETPIPE_SZ) };
-        if capacity <= 0 {
+        let current_capacity = unsafe { fcntl(fd, F_GETPIPE_SZ) };
+        if current_capacity <= 0 {
             return Ok(None);
         }
-        let capacity = capacity as usize;
+        let current_capacity = current_capacity as usize;
+        let capacity = if current_capacity < TARGET_PIPE_CAPACITY {
+            // Best effort: unprivileged callers can usually grow their pipe up
+            // to the system limit. If the request is denied, keep using the
+            // capacity already available rather than disabling the fast path.
+            // SAFETY: F_SETPIPE_SZ takes the requested size as its third arg.
+            let requested = unsafe { fcntl(fd, F_SETPIPE_SZ, TARGET_PIPE_CAPACITY as c_int) };
+            if requested > 0 {
+                requested as usize
+            } else {
+                current_capacity
+            }
+        } else {
+            current_capacity
+        };
         // SAFETY: getpagesize has no preconditions and returns the host page size.
         let page_size = unsafe { getpagesize() };
         if page_size <= 0
@@ -227,23 +243,26 @@ mod tests {
         // SAFETY: pipe returned a fresh, uniquely owned descriptor.
         let writer = unsafe { File::from_raw_fd(fds[1]) };
         // SAFETY: F_GETPIPE_SZ takes no third argument.
+        let initial_capacity = unsafe { fcntl(writer.as_raw_fd(), F_GETPIPE_SZ) } as usize;
+        let mut fast = VmspliceWriter::for_fd(writer.as_raw_fd())
+            .unwrap()
+            .expect("anonymous pipe should enable vmsplice");
+        // Read after construction because the fast path may have raised a
+        // smaller pipe to 128 KiB.
         let capacity = unsafe { fcntl(writer.as_raw_fd(), F_GETPIPE_SZ) } as usize;
-        assert!(capacity > 0);
+        assert!(capacity >= initial_capacity);
+        assert_eq!(capacity, fast.capacity);
 
         let payload: Vec<u8> = (0..capacity * 3 + 137)
             .map(|i| (i.wrapping_mul(37) & 0xff) as u8)
             .collect();
+        let expected = payload.clone();
         let reader_thread = thread::spawn(move || {
             let mut reader = reader;
             let mut got = Vec::new();
             reader.read_to_end(&mut got).unwrap();
             got
         });
-
-        let expected = payload.clone();
-        let mut fast = VmspliceWriter::for_fd(writer.as_raw_fd())
-            .unwrap()
-            .expect("anonymous pipe should enable vmsplice");
         let mut at = 0;
         for size in [19, capacity / 2, capacity + 23, capacity * 2] {
             if at == payload.len() {

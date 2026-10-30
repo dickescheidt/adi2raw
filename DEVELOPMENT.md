@@ -40,11 +40,13 @@ for ordered output.
 ## Linux pipe output
 
 On Linux, `dump` selects a `vmsplice(2)` writer only when stdout is a pipe and
-its capacity is page-aligned and no larger than 1 MiB. `--no-vmsplice` forces
-the ordinary buffered `Write` path for comparison or troubleshooting. Other
-outputs and non-Linux builds use that fallback automatically; no extra crate is
-required. The isolated unsafe syscall and its page-aligned double buffers live
-in `src/linux_pipe.rs`.
+its capacity is page-aligned and no larger than 1 MiB. It best-effort requests
+128 KiB when the pipe is smaller and falls back to the capacity already
+available if the request is denied. `--no-vmsplice` forces the ordinary
+buffered `Write` path (without resizing the pipe) for comparison or
+troubleshooting. Other outputs and non-Linux builds use that fallback
+automatically; no extra crate is required. The isolated unsafe syscall and its
+page-aligned double buffers live in `src/linux_pipe.rs`.
 
 The writer copies output into two page-aligned buffers sized to the pipe
 capacity. This copy is not inherent to `vmsplice`, but keeps borrowed and
