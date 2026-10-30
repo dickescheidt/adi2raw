@@ -37,6 +37,35 @@ support sparse files, holes do not consume storage. The apparent file size can
 still be large, and stdout remains empty until spooled data has been assembled
 for ordered output.
 
+## Linux pipe output
+
+On Linux, `dump` selects a `vmsplice(2)` writer only when stdout is a pipe and
+its capacity is page-aligned and no larger than 1 MiB. `--no-vmsplice` forces
+the ordinary buffered `Write` path for comparison or troubleshooting. Other
+outputs and non-Linux builds use that fallback automatically; no extra crate is
+required. The isolated unsafe syscall and its page-aligned double buffers live
+in `src/linux_pipe.rs`.
+
+The writer copies output into two page-aligned buffers sized to the pipe
+capacity. This copy is not inherent to `vmsplice`, but keeps borrowed and
+reused source slices stable until the kernel no longer references them. A
+buffer is not reused until a full subsequent buffer has entered the pipe, which
+means the pipe had to drain the older full buffer first. After any successful
+splice, the buffers are intentionally retained until process exit so the final
+queued pages cannot be reused while a downstream reader may still reference
+them. This bounds the retained memory to at most 2 MiB per dump process.
+
+The Linux unit test checks the fast path over an anonymous pipe, including
+multiple full buffers, a partial final buffer, and byte-for-byte equality; a
+regular file descriptor exercises fallback detection. The complete integration
+suite also covers the real `dump | dd` path and early downstream closure.
+
+A synthetic 8 GiB mostly-zero image streamed to `cat >/dev/null` measured
+9.56 s median on the base commit and 4.38 s median with this path (three runs
+per build after warm-up, alternating build order; about 2.18x on this host).
+This measures stdout streaming rather than ADI decoding or disk input; it is
+machine- and workload-specific, not a performance guarantee.
+
 ## Partition tables
 
 GPT is synthesized by default from recovered volume metadata. `--partition-table

@@ -16,6 +16,8 @@ macro_rules! debug_warn {
 mod adi;
 mod crc;
 mod gpt;
+#[cfg(target_os = "linux")]
+mod linux_pipe;
 mod lz4;
 mod mbr;
 mod records;
@@ -103,10 +105,32 @@ struct Streamer<W: Write> {
     no_spool: bool,
     pub broken: bool,
     pub total: u64,
+    #[cfg(target_os = "linux")]
+    vmsplice: Option<linux_pipe::VmspliceWriter>,
 }
 
 impl<W: Write> Streamer<W> {
+    #[cfg(test)]
     fn new(out: W, max_pending: usize, spool_dir: Option<PathBuf>, no_spool: bool) -> Self {
+        Self::new_with_fd(out, max_pending, spool_dir, no_spool, None, false)
+    }
+
+    fn new_with_fd(
+        out: W,
+        max_pending: usize,
+        spool_dir: Option<PathBuf>,
+        no_spool: bool,
+        output_fd: Option<i32>,
+        no_vmsplice: bool,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        let vmsplice = if no_vmsplice {
+            None
+        } else {
+            output_fd.and_then(|fd| linux_pipe::VmspliceWriter::for_fd(fd).ok().flatten())
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = (output_fd, no_vmsplice);
         Self {
             out,
             pos: 0,
@@ -117,12 +141,28 @@ impl<W: Write> Streamer<W> {
             no_spool,
             broken: false,
             total: 0,
+            #[cfg(target_os = "linux")]
+            vmsplice,
         }
     }
 
     fn raw(&mut self, data: &[u8]) -> Result<(), String> {
         if self.broken {
             return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(fast) = self.vmsplice.as_mut() {
+            return match fast.write_all(data) {
+                Ok(()) => {
+                    self.pos += data.len() as u64;
+                    Ok(())
+                }
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    self.broken = true;
+                    Ok(())
+                }
+                Err(e) => Err(format!("write failed at offset {}: {e}", self.pos)),
+            };
         }
         match self.out.write_all(data) {
             Ok(()) => {
@@ -302,6 +342,17 @@ impl<W: Write> Streamer<W> {
         self.total = self.pos;
         if self.broken {
             return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(fast) = self.vmsplice.as_mut() {
+            match fast.flush() {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    self.broken = true;
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("flush failed at offset {}: {e}", self.pos)),
+            }
         }
         match self.out.flush() {
             Ok(()) => Ok(()),
@@ -1024,6 +1075,7 @@ struct Options {
     spool_dir: Option<PathBuf>,
     max_pending: Option<usize>,
     no_spool: bool,
+    no_vmsplice: bool,
     full_scan: bool,
 }
 
@@ -1054,6 +1106,7 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
             options.spool_dir.clone(),
             options.max_pending.unwrap_or(MAX_PENDING),
             options.no_spool,
+            options.no_vmsplice,
         ),
         ImageMap::Legacy { blocks, map } => {
             // Native tables are preserved; dump_legacy rejects an explicit
@@ -1066,6 +1119,7 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
                 options.spool_dir.clone(),
                 options.max_pending.unwrap_or(MAX_PENDING),
                 options.no_spool,
+                options.no_vmsplice,
             )
         }
     }
@@ -1078,6 +1132,7 @@ fn dump_standard(
     spool_dir: Option<PathBuf>,
     max_pending: usize,
     no_spool: bool,
+    no_vmsplice: bool,
 ) -> Result<(), String> {
     if std.encrypt_mode.is_some_and(|m| m != 0) {
         return Err("encrypted images are not supported (0x106 mode != 0)".into());
@@ -1109,11 +1164,21 @@ fn dump_standard(
         std.blocks.len()
     );
     let stdout = io::stdout();
-    let mut st = Streamer::new(
-        BufWriter::with_capacity(1024 * 1024, stdout.lock()),
+    let lock = stdout.lock();
+    #[cfg(target_os = "linux")]
+    let output_fd = {
+        use std::os::fd::AsRawFd;
+        Some(lock.as_raw_fd())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let output_fd = None;
+    let mut st = Streamer::new_with_fd(
+        BufWriter::with_capacity(1024 * 1024, lock),
         max_pending,
         spool_dir,
         no_spool,
+        output_fd,
+        no_vmsplice,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1164,6 +1229,7 @@ fn dump_standard(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dump_legacy(
     mut adi: Adi,
     blocks: &[BlockRec],
@@ -1172,6 +1238,7 @@ fn dump_legacy(
     spool_dir: Option<PathBuf>,
     max_pending: usize,
     no_spool: bool,
+    no_vmsplice: bool,
 ) -> Result<(), String> {
     let plan = build_plan(map, blocks);
     let fmin = future_min(&plan);
@@ -1210,11 +1277,21 @@ fn dump_legacy(
     );
 
     let stdout = io::stdout();
-    let mut st = Streamer::new(
-        BufWriter::with_capacity(1024 * 1024, stdout.lock()),
+    let lock = stdout.lock();
+    #[cfg(target_os = "linux")]
+    let output_fd = {
+        use std::os::fd::AsRawFd;
+        Some(lock.as_raw_fd())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let output_fd = None;
+    let mut st = Streamer::new_with_fd(
+        BufWriter::with_capacity(1024 * 1024, lock),
         max_pending,
         spool_dir,
         no_spool,
+        output_fd,
+        no_vmsplice,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1287,6 +1364,7 @@ fn usage() -> String {
          --spool-dir DIR                Temporary-file location (default: {})\n  \
          --max-pending-mb N             Memory buffer before spooling (default: 256)\n  \
          --no-spool                     Fail instead of using a temporary file\n  \
+         --no-vmsplice                  Disable Linux pipe fast path\n  \
          --full-scan                    Search the entire file for records\n  \
          --debug                        Show additional diagnostics\n  \
          -h, --help                     Show this help\n\n\
@@ -1322,6 +1400,7 @@ fn main() -> ExitCode {
         spool_dir: None,
         max_pending: None,
         no_spool: false,
+        no_vmsplice: false,
         full_scan: false,
     };
     let mut parse_error = None;
@@ -1336,6 +1415,8 @@ fn main() -> ExitCode {
             options.full_scan = true;
         } else if parsing_options && arg == "--no-spool" {
             options.no_spool = true;
+        } else if parsing_options && arg == "--no-vmsplice" {
+            options.no_vmsplice = true;
         } else if parsing_options && (arg == "-p" || arg == "--partition-table") {
             match it.next() {
                 Some(value) => match parse_partition_table(&value) {
@@ -1401,13 +1482,12 @@ fn main() -> ExitCode {
             if options.partition_table.is_none()
                 && options.spool_dir.is_none()
                 && options.max_pending.is_none()
-                && !options.no_spool =>
+                && !options.no_spool
+                && !options.no_vmsplice =>
         {
             cmd_info(Path::new(&args[2]), &options)
         }
-        (Some("info"), 3) => {
-            Err("partition-table and dump buffering options only apply to dump".into())
-        }
+        (Some("info"), 3) => Err("partition-table and dump-only options only apply to dump".into()),
         (Some("dump"), 3) => cmd_dump(Path::new(&args[2]), &options),
         _ => {
             eprintln!("{}\n", usage());

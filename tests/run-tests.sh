@@ -23,6 +23,7 @@ python3 tests/make_standard_adi.py "$TMP/split.adi" split
 "$BIN" --help > "$TMP/help.txt"
 grep -q -- "--max-pending-mb N" "$TMP/help.txt"
 grep -q -- "--no-spool" "$TMP/help.txt"
+grep -q -- "--no-vmsplice" "$TMP/help.txt"
 grep -q -- "--full-scan" "$TMP/help.txt"
 grep -q -- "default:" "$TMP/help.txt"
 
@@ -150,7 +151,10 @@ echo "== real dd pipeline =="
 "$BIN" dump "$TMP/multi.adi" 2>/dev/null \
   | dd of="$TMP/dd.img" bs=1M iflag=fullblock status=none
 cmp "$TMP/multi.img" "$TMP/dd.img"
-echo "dump | dd: OK"
+"$BIN" dump --no-vmsplice "$TMP/multi.adi" 2>/dev/null \
+  | dd of="$TMP/dd-no-vmsplice.img" bs=1M iflag=fullblock status=none
+cmp "$TMP/multi.img" "$TMP/dd-no-vmsplice.img"
+echo "dump | dd (vmsplice enabled/disabled): OK"
 
 if [[ -n "${ADI_EXTRACT:-}" && -x "$ADI_EXTRACT" ]]; then
     echo "== reference comparison (C++ adi-extract) =="

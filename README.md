@@ -49,6 +49,7 @@ adi2raw dump --partition-table mbr backup.adi > disk-mbr.img
 | `--spool-dir DIR` | Choose where temporary reorder data is stored. The default is shown by `--help`. |
 | `--max-pending-mb N` | Set the in-memory reorder limit before spooling (default: 256 MiB). |
 | `--no-spool` | Fail rather than use a temporary file if the memory limit is exceeded. |
+| `--no-vmsplice` | Disable the Linux pipe fast path. |
 | `--full-scan` | Search the entire backup for metadata instead of trying the faster tail scan first. |
 | `--debug` | Print additional diagnostics to stderr. |
 | `-h, --help` | Show the complete option list. |
