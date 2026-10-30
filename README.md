@@ -31,10 +31,11 @@ adi2raw dump backup.adi > disk.img
 ```
 
 To stream directly to a device, double-check the destination: this overwrites
-it completely.
+it completely. For high throughput on Linux:
 
 ```bash
-adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress
+adi2raw dump --busy-loop backup.adi \
+  | dd iflag=fullblock of=/dev/sdX bs=1M status=progress
 ```
 
 Options go before the filename:

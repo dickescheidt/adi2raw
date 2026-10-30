@@ -1401,7 +1401,8 @@ fn usage() -> String {
          -h, --help                     Show this help\n\n\
          Examples:\n  \
          adi2raw dump backup.adi > disk.img\n  \
-         adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress",
+         adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress\n  \
+         adi2raw dump --busy-loop backup.adi | dd iflag=fullblock of=/dev/sdX bs=1M status=progress",
         env!("CARGO_PKG_VERSION"),
         env::temp_dir().display()
     )
