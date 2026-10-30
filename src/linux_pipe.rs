@@ -1,10 +1,12 @@
 //! Linux-only stdout pipe fast path based on `vmsplice(2)`.
 //!
-//! The two page-aligned staging buffers are kept alive while the kernel may
-//! still reference them. Each full buffer is exactly the pipe's capacity; the
-//! blocking `vmsplice` of the next full buffer therefore cannot complete until
-//! the previous full buffer has drained. The final buffer is intentionally
-//! retained until process exit because stdout has no portable completion signal
+//! The two staging buffers are page-aligned and may be advised for transparent
+//! huge pages. They are kept alive while the kernel may still reference them.
+//! Each full buffer is exactly the pipe's capacity. By default, the blocking
+//! `vmsplice` of the next full buffer cannot complete until the previous one
+//! has drained; busy-loop mode retries nonblocking calls until they can proceed.
+//! The final buffer is intentionally retained until process exit because stdout
+//! has no portable completion signal
 //! for when its reader has consumed the last bytes.
 
 use std::alloc::{alloc, dealloc, Layout};
@@ -16,6 +18,9 @@ const F_SETPIPE_SZ: c_int = 1031;
 const F_GETPIPE_SZ: c_int = 1032;
 const TARGET_PIPE_CAPACITY: usize = 128 * 1024;
 const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
+const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+const MADV_HUGEPAGE: c_int = 14;
+const SPLICE_F_NONBLOCK: c_uint = 2;
 
 #[repr(C)]
 struct IoVec {
@@ -27,6 +32,7 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn getpagesize() -> c_int;
     fn vmsplice(fd: c_int, iov: *const IoVec, nr_segs: usize, flags: c_uint) -> isize;
+    fn madvise(addr: *mut c_void, length: usize, advice: c_int) -> c_int;
 }
 
 struct AlignedBuffer {
@@ -35,7 +41,16 @@ struct AlignedBuffer {
 }
 
 impl AlignedBuffer {
-    fn new(len: usize, align: usize) -> io::Result<Self> {
+    fn new(len: usize, page_align: usize, huge_pages: bool) -> io::Result<Self> {
+        if huge_pages {
+            if let Some(buffer) = Self::try_huge_page(len) {
+                return Ok(buffer);
+            }
+        }
+        Self::new_aligned(len, page_align)
+    }
+
+    fn new_aligned(len: usize, align: usize) -> io::Result<Self> {
         let layout = Layout::from_size_align(len, align).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid pipe buffer layout")
         })?;
@@ -46,6 +61,26 @@ impl AlignedBuffer {
             io::Error::new(io::ErrorKind::OutOfMemory, "pipe buffer allocation failed")
         })?;
         Ok(Self { ptr, layout })
+    }
+
+    fn try_huge_page(len: usize) -> Option<Self> {
+        let rounded_len = len
+            .checked_add(HUGE_PAGE_SIZE - 1)?
+            .checked_div(HUGE_PAGE_SIZE)?
+            .checked_mul(HUGE_PAGE_SIZE)?;
+        let layout = Layout::from_size_align(rounded_len, HUGE_PAGE_SIZE).ok()?;
+        // SAFETY: `layout` is valid and the allocated region remains owned
+        // here until returned or deallocated below.
+        let ptr = NonNull::new(unsafe { alloc(layout) })?;
+        // MADV_HUGEPAGE is only a hint; a rejected hint must not disable output.
+        // SAFETY: `ptr` is 2 MiB-aligned and `layout.size()` is page-aligned.
+        if unsafe { madvise(ptr.as_ptr().cast(), layout.size(), MADV_HUGEPAGE) } == 0 {
+            Some(Self { ptr, layout })
+        } else {
+            // SAFETY: this pointer and layout are the values returned by alloc.
+            unsafe { dealloc(ptr.as_ptr(), layout) };
+            None
+        }
     }
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -74,12 +109,13 @@ pub(crate) struct VmspliceWriter {
     filled: usize,
     has_spliced: bool,
     finished: bool,
+    busy_loop: bool,
 }
 
 impl VmspliceWriter {
     /// Returns `None` when the descriptor is not a Linux pipe or its size is
     /// outside the range supported by this bounded fast path.
-    pub(crate) fn for_fd(fd: c_int) -> io::Result<Option<Self>> {
+    pub(crate) fn for_fd(fd: c_int, huge_pages: bool, busy_loop: bool) -> io::Result<Option<Self>> {
         // SAFETY: F_GETPIPE_SZ takes no third argument and does not retain fd.
         let current_capacity = unsafe { fcntl(fd, F_GETPIPE_SZ) };
         if current_capacity <= 0 {
@@ -109,8 +145,8 @@ impl VmspliceWriter {
             return Ok(None);
         }
         let buffers = [
-            AlignedBuffer::new(capacity, page_size as usize)?,
-            AlignedBuffer::new(capacity, page_size as usize)?,
+            AlignedBuffer::new(capacity, page_size as usize, huge_pages)?,
+            AlignedBuffer::new(capacity, page_size as usize, huge_pages)?,
         ];
         Ok(Some(Self {
             fd,
@@ -120,6 +156,7 @@ impl VmspliceWriter {
             filled: 0,
             has_spliced: false,
             finished: false,
+            busy_loop,
         }))
     }
 
@@ -182,27 +219,48 @@ impl VmspliceWriter {
                 base: current.cast(),
                 len: len - offset,
             };
-            // SAFETY: `iov` describes the readable region above. vmsplice does
-            // not retain the iovec itself; the referenced pages remain stable
-            // under the caller's safety contract.
-            let written = unsafe { vmsplice(self.fd, &iov, 1, 0) };
-            if written < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+            // SAFETY: the current range lies within `base..base+len`, whose
+            // stability is guaranteed by this function's caller.
+            match unsafe { self.splice_once(&iov) } {
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if self.busy_loop && error.kind() == io::ErrorKind::WouldBlock => {
+                    std::hint::spin_loop();
                 }
-                return Err(err);
+                Err(error) => return Err(error),
             }
-            if written == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "vmsplice returned zero",
-                ));
-            }
-            self.has_spliced = true;
-            offset += written as usize;
         }
         Ok(())
+    }
+
+    /// Perform one vmsplice call.
+    ///
+    /// # Safety
+    /// `iov` must point to readable, stable memory for the duration of the call.
+    fn splice_flags(&self) -> c_uint {
+        if self.busy_loop {
+            SPLICE_F_NONBLOCK
+        } else {
+            0
+        }
+    }
+
+    unsafe fn splice_once(&mut self, iov: &IoVec) -> io::Result<usize> {
+        let flags = self.splice_flags();
+        // SAFETY: `iov` points to a readable, stable region for the duration
+        // of this syscall, as guaranteed by `send_memory` and the unit test.
+        let written = unsafe { vmsplice(self.fd, iov, 1, flags) };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "vmsplice returned zero",
+            ));
+        }
+        self.has_spliced = true;
+        Ok(written as usize)
     }
 }
 
@@ -221,16 +279,18 @@ impl Drop for VmspliceWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::{VmspliceWriter, F_GETPIPE_SZ};
+    use super::{AlignedBuffer, IoVec, VmspliceWriter, F_GETPIPE_SZ};
     use std::fs::File;
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::raw::c_int;
+    use std::os::raw::{c_int, c_void};
     use std::thread;
 
     unsafe extern "C" {
         fn pipe(fds: *mut c_int) -> c_int;
         fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+        fn write(fd: c_int, buf: *const c_void, count: usize) -> isize;
+        fn getpagesize() -> c_int;
     }
 
     #[test]
@@ -244,9 +304,10 @@ mod tests {
         let writer = unsafe { File::from_raw_fd(fds[1]) };
         // SAFETY: F_GETPIPE_SZ takes no third argument.
         let initial_capacity = unsafe { fcntl(writer.as_raw_fd(), F_GETPIPE_SZ) } as usize;
-        let mut fast = VmspliceWriter::for_fd(writer.as_raw_fd())
+        let mut fast = VmspliceWriter::for_fd(writer.as_raw_fd(), false, false)
             .unwrap()
             .expect("anonymous pipe should enable vmsplice");
+        assert_eq!(fast.splice_flags(), 0);
         // Read after construction because the fast path may have raised a
         // smaller pipe to 128 KiB.
         let capacity = unsafe { fcntl(writer.as_raw_fd(), F_GETPIPE_SZ) } as usize;
@@ -283,8 +344,77 @@ mod tests {
     }
 
     #[test]
+    fn huge_page_hint_is_optional_and_page_aligned() {
+        let normal = AlignedBuffer::new(128 * 1024, 4096, false).unwrap();
+        assert_eq!(normal.layout.align(), 4096);
+        assert_eq!(normal.layout.size(), 128 * 1024);
+        assert_eq!(normal.ptr.as_ptr() as usize % 4096, 0);
+
+        let advised = AlignedBuffer::new(128 * 1024, 4096, true).unwrap();
+        assert_eq!(advised.ptr.as_ptr() as usize % 4096, 0);
+        if advised.layout.align() == super::HUGE_PAGE_SIZE {
+            assert_eq!(advised.layout.size() % super::HUGE_PAGE_SIZE, 0);
+        } else {
+            assert_eq!(advised.layout.size(), 128 * 1024);
+        }
+    }
+
+    #[test]
+    fn busy_loop_vmsplice_reports_would_block_on_a_full_pipe() {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` points to two writable integers as required by pipe(2).
+        assert_eq!(unsafe { pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe returned fresh, uniquely owned descriptors.
+        let reader = unsafe { File::from_raw_fd(fds[0]) };
+        // SAFETY: pipe returned a fresh, uniquely owned descriptor.
+        let writer = unsafe { File::from_raw_fd(fds[1]) };
+        let fd = writer.as_raw_fd();
+        let mut fast = VmspliceWriter::for_fd(fd, false, true)
+            .unwrap()
+            .expect("anonymous pipe should enable vmsplice");
+        assert_eq!(fast.splice_flags(), super::SPLICE_F_NONBLOCK);
+
+        const F_GETFL: c_int = 3;
+        const F_SETFL: c_int = 4;
+        const O_NONBLOCK: c_int = 0x800;
+        // SAFETY: fcntl F_GETFL takes no third argument.
+        let flags = unsafe { fcntl(fd, F_GETFL) };
+        assert!(flags >= 0);
+        // SAFETY: F_SETFL takes the new status flags as its third argument.
+        assert_eq!(unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) }, 0);
+        let page = vec![0x5a; 4096];
+        let mut filled = 0;
+        while filled < fast.capacity {
+            // SAFETY: `page` is readable for the requested number of bytes.
+            let written = unsafe { write(fd, page.as_ptr().cast(), page.len()) };
+            assert!(
+                written > 0,
+                "failed to fill pipe: {}",
+                std::io::Error::last_os_error()
+            );
+            filled += written as usize;
+        }
+
+        let page_size = unsafe { getpagesize() as usize };
+        let mut payload = AlignedBuffer::new(page_size, page_size, false).unwrap();
+        payload.as_mut_slice().fill(0xa5);
+        let iov = IoVec {
+            base: payload.as_ptr().cast::<c_void>(),
+            len: page_size,
+        };
+        // SAFETY: payload remains allocated and unchanged for this syscall.
+        let error = unsafe { fast.splice_once(&iov) }.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+        drop(fast);
+        drop(writer);
+        drop(reader);
+    }
+
+    #[test]
     fn non_pipe_descriptor_uses_fallback() {
         let file = File::open("/dev/null").unwrap();
-        assert!(VmspliceWriter::for_fd(file.as_raw_fd()).unwrap().is_none());
+        assert!(VmspliceWriter::for_fd(file.as_raw_fd(), true, false)
+            .unwrap()
+            .is_none());
     }
 }

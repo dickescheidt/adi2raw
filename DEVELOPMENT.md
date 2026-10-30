@@ -42,30 +42,37 @@ for ordered output.
 On Linux, `dump` selects a `vmsplice(2)` writer only when stdout is a pipe and
 its capacity is page-aligned and no larger than 1 MiB. It best-effort requests
 128 KiB when the pipe is smaller and falls back to the capacity already
-available if the request is denied. `--no-vmsplice` forces the ordinary
-buffered `Write` path (without resizing the pipe) for comparison or
-troubleshooting. Other outputs and non-Linux builds use that fallback
-automatically; no extra crate is required. The isolated unsafe syscall and its
-page-aligned double buffers live in `src/linux_pipe.rs`.
+available if the request is denied. By default, the two staging buffers are
+2 MiB-aligned and receive a best-effort `MADV_HUGEPAGE` hint; if allocation or
+the hint fails, ordinary page-aligned buffers are used. `--no-huge-pages`
+disables that attempt. `--busy-loop` opts into nonblocking `vmsplice` calls and
+spins on a full pipe; the default is blocking, avoiding busy CPU use.
 
-The writer copies output into two page-aligned buffers sized to the pipe
-capacity. This copy is not inherent to `vmsplice`, but keeps borrowed and
+`--no-vmsplice` forces the ordinary buffered `Write` path and skips pipe
+resizing and these buffer options. Other outputs and non-Linux builds use that
+fallback automatically; no extra crate is required. The isolated unsafe
+syscalls and buffer management live in `src/linux_pipe.rs`.
+
+The writer copies output into two page-aligned staging buffers sized for the
+pipe capacity. This copy is not inherent to `vmsplice`, but keeps borrowed and
 reused source slices stable until the kernel no longer references them. A
 buffer is not reused until a full subsequent buffer has entered the pipe, which
 means the pipe had to drain the older full buffer first. After any successful
-splice, the buffers are intentionally retained until process exit so the final
-queued pages cannot be reused while a downstream reader may still reference
-them. This bounds the retained memory to at most 2 MiB per dump process.
+splice, both allocations are intentionally retained until process exit so the
+final queued pages cannot be reused while a downstream reader may still
+reference them. This bounds retained staging memory to 4 MiB per dump process
+when huge-page allocation succeeds, or at most 2 MiB with ordinary buffers.
 
 The Linux unit test checks the fast path over an anonymous pipe, including
 multiple full buffers, a partial final buffer, and byte-for-byte equality; a
 regular file descriptor exercises fallback detection. The complete integration
 suite also covers the real `dump | dd` path and early downstream closure.
 
-A synthetic 8 GiB mostly-zero image streamed to `cat >/dev/null` measured
-9.56 s median on the base commit and 4.38 s median with this path (three runs
-per build after warm-up, alternating build order; about 2.18x on this host).
-This measures stdout streaming rather than ADI decoding or disk input; it is
+Before pipe resizing and huge-page hints were added, a synthetic 8 GiB
+mostly-zero image streamed to `cat >/dev/null` measured 9.56 s median on the
+base commit and 4.38 s median with the initial vmsplice path (three runs per
+build after warm-up, alternating build order; about 2.18x on that host). This
+measures stdout streaming rather than ADI decoding or disk input; it is
 machine- and workload-specific, not a performance guarantee.
 
 ## Partition tables

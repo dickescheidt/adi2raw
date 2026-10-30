@@ -95,6 +95,13 @@ impl Drop for Spool {
 // Ordered byte stream with a bounded reorder buffer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Default)]
+struct PipeOptions {
+    no_vmsplice: bool,
+    no_huge_pages: bool,
+    busy_loop: bool,
+}
+
 struct Streamer<W: Write> {
     out: W,
     pos: u64,
@@ -112,7 +119,14 @@ struct Streamer<W: Write> {
 impl<W: Write> Streamer<W> {
     #[cfg(test)]
     fn new(out: W, max_pending: usize, spool_dir: Option<PathBuf>, no_spool: bool) -> Self {
-        Self::new_with_fd(out, max_pending, spool_dir, no_spool, None, false)
+        Self::new_with_fd(
+            out,
+            max_pending,
+            spool_dir,
+            no_spool,
+            None,
+            PipeOptions::default(),
+        )
     }
 
     fn new_with_fd(
@@ -121,16 +135,24 @@ impl<W: Write> Streamer<W> {
         spool_dir: Option<PathBuf>,
         no_spool: bool,
         output_fd: Option<i32>,
-        no_vmsplice: bool,
+        pipe_options: PipeOptions,
     ) -> Self {
         #[cfg(target_os = "linux")]
-        let vmsplice = if no_vmsplice {
+        let vmsplice = if pipe_options.no_vmsplice {
             None
         } else {
-            output_fd.and_then(|fd| linux_pipe::VmspliceWriter::for_fd(fd).ok().flatten())
+            output_fd.and_then(|fd| {
+                linux_pipe::VmspliceWriter::for_fd(
+                    fd,
+                    !pipe_options.no_huge_pages,
+                    pipe_options.busy_loop,
+                )
+                .ok()
+                .flatten()
+            })
         };
         #[cfg(not(target_os = "linux"))]
-        let _ = (output_fd, no_vmsplice);
+        let _ = (output_fd, pipe_options);
         Self {
             out,
             pos: 0,
@@ -1076,6 +1098,8 @@ struct Options {
     max_pending: Option<usize>,
     no_spool: bool,
     no_vmsplice: bool,
+    no_huge_pages: bool,
+    busy_loop: bool,
     full_scan: bool,
 }
 
@@ -1098,6 +1122,11 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
         );
     }
     let opened = open_image(path, options.full_scan)?;
+    let pipe_options = PipeOptions {
+        no_vmsplice: options.no_vmsplice,
+        no_huge_pages: options.no_huge_pages,
+        busy_loop: options.busy_loop,
+    };
     match opened.kind {
         ImageMap::Standard(std) => dump_standard(
             opened.adi,
@@ -1106,7 +1135,7 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
             options.spool_dir.clone(),
             options.max_pending.unwrap_or(MAX_PENDING),
             options.no_spool,
-            options.no_vmsplice,
+            pipe_options,
         ),
         ImageMap::Legacy { blocks, map } => {
             // Native tables are preserved; dump_legacy rejects an explicit
@@ -1119,7 +1148,7 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
                 options.spool_dir.clone(),
                 options.max_pending.unwrap_or(MAX_PENDING),
                 options.no_spool,
-                options.no_vmsplice,
+                pipe_options,
             )
         }
     }
@@ -1132,7 +1161,7 @@ fn dump_standard(
     spool_dir: Option<PathBuf>,
     max_pending: usize,
     no_spool: bool,
-    no_vmsplice: bool,
+    pipe_options: PipeOptions,
 ) -> Result<(), String> {
     if std.encrypt_mode.is_some_and(|m| m != 0) {
         return Err("encrypted images are not supported (0x106 mode != 0)".into());
@@ -1178,7 +1207,7 @@ fn dump_standard(
         spool_dir,
         no_spool,
         output_fd,
-        no_vmsplice,
+        pipe_options,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1238,7 +1267,7 @@ fn dump_legacy(
     spool_dir: Option<PathBuf>,
     max_pending: usize,
     no_spool: bool,
-    no_vmsplice: bool,
+    pipe_options: PipeOptions,
 ) -> Result<(), String> {
     let plan = build_plan(map, blocks);
     let fmin = future_min(&plan);
@@ -1291,7 +1320,7 @@ fn dump_legacy(
         spool_dir,
         no_spool,
         output_fd,
-        no_vmsplice,
+        pipe_options,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1365,6 +1394,8 @@ fn usage() -> String {
          --max-pending-mb N             Memory buffer before spooling (default: 256)\n  \
          --no-spool                     Fail instead of using a temporary file\n  \
          --no-vmsplice                  Disable Linux pipe fast path\n  \
+         --no-huge-pages                Disable default huge-page hint\n  \
+         --busy-loop                    Opt into pipe-write spinning (higher CPU use)\n  \
          --full-scan                    Search the entire file for records\n  \
          --debug                        Show additional diagnostics\n  \
          -h, --help                     Show this help\n\n\
@@ -1401,6 +1432,8 @@ fn main() -> ExitCode {
         max_pending: None,
         no_spool: false,
         no_vmsplice: false,
+        no_huge_pages: false,
+        busy_loop: false,
         full_scan: false,
     };
     let mut parse_error = None;
@@ -1417,6 +1450,10 @@ fn main() -> ExitCode {
             options.no_spool = true;
         } else if parsing_options && arg == "--no-vmsplice" {
             options.no_vmsplice = true;
+        } else if parsing_options && arg == "--no-huge-pages" {
+            options.no_huge_pages = true;
+        } else if parsing_options && arg == "--busy-loop" {
+            options.busy_loop = true;
         } else if parsing_options && (arg == "-p" || arg == "--partition-table") {
             match it.next() {
                 Some(value) => match parse_partition_table(&value) {
@@ -1483,7 +1520,9 @@ fn main() -> ExitCode {
                 && options.spool_dir.is_none()
                 && options.max_pending.is_none()
                 && !options.no_spool
-                && !options.no_vmsplice =>
+                && !options.no_vmsplice
+                && !options.no_huge_pages
+                && !options.busy_loop =>
         {
             cmd_info(Path::new(&args[2]), &options)
         }
