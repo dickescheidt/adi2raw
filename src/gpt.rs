@@ -56,7 +56,7 @@ fn part_type(v: &Volume, last: bool) -> (&'static [u8; 16], &'static str) {
         (&ESP, "EFI system partition")
     } else if v.fs.is_empty() || v.fs == "raw" {
         (&MSR, "Microsoft reserved partition")
-    } else if last && v.sectors * SECTOR < (4u64 << 30) {
+    } else if last && v.sectors < (4u64 << 30) / SECTOR {
         (&RECOVERY, "Basic data partition")
     } else {
         (&DATA, "Basic data partition")
@@ -79,6 +79,12 @@ fn entries(volumes: &[Volume]) -> Vec<u8> {
         if v.sectors == 0 || n >= 128 {
             continue;
         }
+        let Some(last_lba) = v.lba.checked_add(v.sectors - 1) else {
+            debug_warn!(
+                "adi2raw: warn: volume {i}: GPT partition end overflows; omitted; verify output"
+            );
+            continue;
+        };
         let (fallback_guid, name) = part_type(v, i + 1 == volumes.len());
         let recovered_type = v.type_guid.iter().any(|&b| b != 0);
         let recovered_unique = v.unique_guid.iter().any(|&b| b != 0);
@@ -100,7 +106,7 @@ fn entries(volumes: &[Volume]) -> Vec<u8> {
             e[17] = 0x51u8.wrapping_add(n as u8);
         }
         put64(e, 32, v.lba);
-        put64(e, 40, v.lba + v.sectors - 1);
+        put64(e, 40, last_lba);
         if v.part_name.is_empty() {
             for (k, ch) in name.bytes().take(35).enumerate() {
                 e[56 + 2 * k] = ch;
@@ -166,4 +172,41 @@ pub fn build(disk_sectors: u64, volumes: &[Volume]) -> (Vec<u8>, Vec<u8>) {
 
 pub fn suffix_start(disk_sectors: u64) -> u64 {
     (disk_sectors - 33) * SECTOR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn volume(lba: u64, sectors: u64) -> Volume {
+        Volume {
+            first: 0,
+            last: 0,
+            fs: "NTFS".into(),
+            label: String::new(),
+            cluster: 512,
+            data_base: 0,
+            lba,
+            sectors,
+            stored: 0,
+            max_region: 0,
+            type_guid: [0; 16],
+            unique_guid: [0; 16],
+            part_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn huge_sector_count_does_not_overflow_partition_type_check() {
+        assert_eq!(
+            part_type(&volume(0, u64::MAX / 2), true).1,
+            "Basic data partition"
+        );
+    }
+
+    #[test]
+    fn overflowing_partition_end_is_omitted_from_gpt() {
+        let raw = entries(&[volume(u64::MAX - 1, 4)]);
+        assert!(raw[..128].iter().all(|&byte| byte == 0));
+    }
 }

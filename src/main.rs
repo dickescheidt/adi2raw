@@ -16,6 +16,8 @@ macro_rules! debug_warn {
 mod adi;
 mod crc;
 mod gpt;
+#[cfg(target_os = "linux")]
+mod linux_pipe;
 mod lz4;
 mod mbr;
 mod records;
@@ -93,6 +95,13 @@ impl Drop for Spool {
 // Ordered byte stream with a bounded reorder buffer
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Default)]
+struct PipeOptions {
+    no_vmsplice: bool,
+    no_huge_pages: bool,
+    busy_loop: bool,
+}
+
 struct Streamer<W: Write> {
     out: W,
     pos: u64,
@@ -103,10 +112,47 @@ struct Streamer<W: Write> {
     no_spool: bool,
     pub broken: bool,
     pub total: u64,
+    #[cfg(target_os = "linux")]
+    vmsplice: Option<linux_pipe::VmspliceWriter>,
 }
 
 impl<W: Write> Streamer<W> {
+    #[cfg(test)]
     fn new(out: W, max_pending: usize, spool_dir: Option<PathBuf>, no_spool: bool) -> Self {
+        Self::new_with_fd(
+            out,
+            max_pending,
+            spool_dir,
+            no_spool,
+            None,
+            PipeOptions::default(),
+        )
+    }
+
+    fn new_with_fd(
+        out: W,
+        max_pending: usize,
+        spool_dir: Option<PathBuf>,
+        no_spool: bool,
+        output_fd: Option<i32>,
+        pipe_options: PipeOptions,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        let vmsplice = if pipe_options.no_vmsplice {
+            None
+        } else {
+            output_fd.and_then(|fd| {
+                linux_pipe::VmspliceWriter::for_fd(
+                    fd,
+                    !pipe_options.no_huge_pages,
+                    pipe_options.busy_loop,
+                )
+                .ok()
+                .flatten()
+            })
+        };
+        #[cfg(not(target_os = "linux"))]
+        let _ = (output_fd, pipe_options);
         Self {
             out,
             pos: 0,
@@ -117,12 +163,28 @@ impl<W: Write> Streamer<W> {
             no_spool,
             broken: false,
             total: 0,
+            #[cfg(target_os = "linux")]
+            vmsplice,
         }
     }
 
     fn raw(&mut self, data: &[u8]) -> Result<(), String> {
         if self.broken {
             return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(fast) = self.vmsplice.as_mut() {
+            return match fast.write_all(data) {
+                Ok(()) => {
+                    self.pos += data.len() as u64;
+                    Ok(())
+                }
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    self.broken = true;
+                    Ok(())
+                }
+                Err(e) => Err(format!("write failed at offset {}: {e}", self.pos)),
+            };
         }
         match self.out.write_all(data) {
             Ok(()) => {
@@ -303,6 +365,17 @@ impl<W: Write> Streamer<W> {
         if self.broken {
             return Ok(());
         }
+        #[cfg(target_os = "linux")]
+        if let Some(fast) = self.vmsplice.as_mut() {
+            match fast.flush() {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    self.broken = true;
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("flush failed at offset {}: {e}", self.pos)),
+            }
+        }
         match self.out.flush() {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::BrokenPipe => {
@@ -385,6 +458,7 @@ fn block_writes(
     let data = match dec.decode_limited(&comp, b.usize as usize) {
         Ok(d) => d,
         Err(e) => {
+            dec.reset();
             eprintln!(
                 "adi2raw: warn: block at 0x{:x}: LZ4 decode failed: {e} — skipped",
                 b.off
@@ -393,6 +467,7 @@ fn block_writes(
         }
     };
     if data.len() != b.usize as usize {
+        dec.reset();
         eprintln!(
             "adi2raw: warn: block at 0x{:x} decoded to {} bytes, expected {}",
             b.off,
@@ -408,6 +483,7 @@ fn block_writes(
         );
     }
     if !b.crc_ok(&data) {
+        dec.reset();
         *crc_bad += 1;
         eprintln!(
             "adi2raw: warn: block at 0x{:x}: CRC32C mismatch (got 0x{:08x}, expected 0x{:08x}) — skipped",
@@ -915,7 +991,10 @@ fn standard_info(adi: &mut Adi, std: &records::StandardImage) -> Result<(), Stri
             "  ('?' = filesystem guessed from the label; its boot sector was not recoverable)"
         );
     }
-    let disk_size = std.disk_sectors * SECTOR;
+    let disk_size = std
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     println!("\n[raw image]");
     println!("  disk:      {} sectors", std.disk_sectors);
     println!(
@@ -977,7 +1056,10 @@ fn legacy_info(_adi: &Adi, blocks: &[BlockRec], map: &SectorMap) -> Result<(), S
             i, v.fs, v.lba, v.sectors, v.cluster, v.last - v.first + 1, v.stored / 1024, v.label
         );
     }
-    let disk_size = map.disk_sectors * SECTOR;
+    let disk_size = map
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     println!("\n[raw image]");
     println!("  disk:      {} sectors", map.disk_sectors);
     println!(
@@ -1024,6 +1106,9 @@ struct Options {
     spool_dir: Option<PathBuf>,
     max_pending: Option<usize>,
     no_spool: bool,
+    no_vmsplice: bool,
+    no_huge_pages: bool,
+    busy_loop: bool,
     full_scan: bool,
 }
 
@@ -1046,6 +1131,11 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
         );
     }
     let opened = open_image(path, options.full_scan)?;
+    let pipe_options = PipeOptions {
+        no_vmsplice: options.no_vmsplice,
+        no_huge_pages: options.no_huge_pages,
+        busy_loop: options.busy_loop,
+    };
     match opened.kind {
         ImageMap::Standard(std) => dump_standard(
             opened.adi,
@@ -1054,6 +1144,7 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
             options.spool_dir.clone(),
             options.max_pending.unwrap_or(MAX_PENDING),
             options.no_spool,
+            pipe_options,
         ),
         ImageMap::Legacy { blocks, map } => {
             // Native tables are preserved; dump_legacy rejects an explicit
@@ -1066,6 +1157,7 @@ fn cmd_dump(path: &Path, options: &Options) -> Result<(), String> {
                 options.spool_dir.clone(),
                 options.max_pending.unwrap_or(MAX_PENDING),
                 options.no_spool,
+                pipe_options,
             )
         }
     }
@@ -1078,11 +1170,15 @@ fn dump_standard(
     spool_dir: Option<PathBuf>,
     max_pending: usize,
     no_spool: bool,
+    pipe_options: PipeOptions,
 ) -> Result<(), String> {
     if std.encrypt_mode.is_some_and(|m| m != 0) {
         return Err("encrypted images are not supported (0x106 mode != 0)".into());
     }
-    let disk_size = std.disk_sectors * SECTOR;
+    let disk_size = std
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     let volumes = standard_volumes(std);
     let (prefix, suffix) = build_partition_table(table, std.disk_sectors, &volumes)?;
     let suffix_at = if table == PartitionTable::Gpt {
@@ -1109,11 +1205,21 @@ fn dump_standard(
         std.blocks.len()
     );
     let stdout = io::stdout();
-    let mut st = Streamer::new(
-        BufWriter::with_capacity(1024 * 1024, stdout.lock()),
+    let lock = stdout.lock();
+    #[cfg(target_os = "linux")]
+    let output_fd = {
+        use std::os::fd::AsRawFd;
+        Some(lock.as_raw_fd())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let output_fd = None;
+    let mut st = Streamer::new_with_fd(
+        BufWriter::with_capacity(1024 * 1024, lock),
         max_pending,
         spool_dir,
         no_spool,
+        output_fd,
+        pipe_options,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1164,6 +1270,7 @@ fn dump_standard(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dump_legacy(
     mut adi: Adi,
     blocks: &[BlockRec],
@@ -1172,10 +1279,14 @@ fn dump_legacy(
     spool_dir: Option<PathBuf>,
     max_pending: usize,
     no_spool: bool,
+    pipe_options: PipeOptions,
 ) -> Result<(), String> {
     let plan = build_plan(map, blocks);
     let fmin = future_min(&plan);
-    let disk_size = map.disk_sectors * SECTOR;
+    let disk_size = map
+        .disk_sectors
+        .checked_mul(SECTOR)
+        .ok_or("disk size exceeds the addressable byte range")?;
     if map.native_table && requested_table.is_some() {
         return Err(
             "this legacy image already contains a native partition table; --partition-table only selects a synthesized table and will not replace native metadata".into(),
@@ -1210,11 +1321,21 @@ fn dump_legacy(
     );
 
     let stdout = io::stdout();
-    let mut st = Streamer::new(
-        BufWriter::with_capacity(1024 * 1024, stdout.lock()),
+    let lock = stdout.lock();
+    #[cfg(target_os = "linux")]
+    let output_fd = {
+        use std::os::fd::AsRawFd;
+        Some(lock.as_raw_fd())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let output_fd = None;
+    let mut st = Streamer::new_with_fd(
+        BufWriter::with_capacity(1024 * 1024, lock),
         max_pending,
         spool_dir,
         no_spool,
+        output_fd,
+        pipe_options,
     );
     st.add(0, prefix)?;
     st.add(suffix_at, suffix)?;
@@ -1287,12 +1408,16 @@ fn usage() -> String {
          --spool-dir DIR                Temporary-file location (default: {})\n  \
          --max-pending-mb N             Memory buffer before spooling (default: 256)\n  \
          --no-spool                     Fail instead of using a temporary file\n  \
+         --no-vmsplice                  Disable Linux pipe fast path\n  \
+         --no-huge-pages                Disable default huge-page hint\n  \
+         --busy-loop                    Opt into pipe-write spinning (higher CPU use)\n  \
          --full-scan                    Search the entire file for records\n  \
          --debug                        Show additional diagnostics\n  \
          -h, --help                     Show this help\n\n\
          Examples:\n  \
          adi2raw dump backup.adi > disk.img\n  \
-         adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress",
+         adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress\n  \
+         adi2raw dump --busy-loop backup.adi | dd iflag=fullblock of=/dev/sdX bs=1M status=progress",
         env!("CARGO_PKG_VERSION"),
         env::temp_dir().display()
     )
@@ -1322,6 +1447,9 @@ fn main() -> ExitCode {
         spool_dir: None,
         max_pending: None,
         no_spool: false,
+        no_vmsplice: false,
+        no_huge_pages: false,
+        busy_loop: false,
         full_scan: false,
     };
     let mut parse_error = None;
@@ -1336,6 +1464,12 @@ fn main() -> ExitCode {
             options.full_scan = true;
         } else if parsing_options && arg == "--no-spool" {
             options.no_spool = true;
+        } else if parsing_options && arg == "--no-vmsplice" {
+            options.no_vmsplice = true;
+        } else if parsing_options && arg == "--no-huge-pages" {
+            options.no_huge_pages = true;
+        } else if parsing_options && arg == "--busy-loop" {
+            options.busy_loop = true;
         } else if parsing_options && (arg == "-p" || arg == "--partition-table") {
             match it.next() {
                 Some(value) => match parse_partition_table(&value) {
@@ -1401,13 +1535,14 @@ fn main() -> ExitCode {
             if options.partition_table.is_none()
                 && options.spool_dir.is_none()
                 && options.max_pending.is_none()
-                && !options.no_spool =>
+                && !options.no_spool
+                && !options.no_vmsplice
+                && !options.no_huge_pages
+                && !options.busy_loop =>
         {
             cmd_info(Path::new(&args[2]), &options)
         }
-        (Some("info"), 3) => {
-            Err("partition-table and dump buffering options only apply to dump".into())
-        }
+        (Some("info"), 3) => Err("partition-table and dump-only options only apply to dump".into()),
         (Some("dump"), 3) => cmd_dump(Path::new(&args[2]), &options),
         _ => {
             eprintln!("{}\n", usage());

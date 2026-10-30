@@ -31,10 +31,11 @@ adi2raw dump backup.adi > disk.img
 ```
 
 To stream directly to a device, double-check the destination: this overwrites
-it completely.
+it completely. For high throughput on Linux:
 
 ```bash
-adi2raw dump backup.adi | dd of=/dev/sdX bs=1M status=progress
+adi2raw dump --busy-loop backup.adi \
+  | dd iflag=fullblock of=/dev/sdX bs=1M status=progress
 ```
 
 Options go before the filename:
@@ -49,6 +50,9 @@ adi2raw dump --partition-table mbr backup.adi > disk-mbr.img
 | `--spool-dir DIR` | Choose where temporary reorder data is stored. The default is shown by `--help`. |
 | `--max-pending-mb N` | Set the in-memory reorder limit before spooling (default: 256 MiB). |
 | `--no-spool` | Fail rather than use a temporary file if the memory limit is exceeded. |
+| `--no-vmsplice` | Disable the Linux pipe fast path. |
+| `--no-huge-pages` | Disable the default best-effort huge-page hint for Linux pipe buffers. |
+| `--busy-loop` | Opt into spinning on a full Linux pipe instead of blocking (uses more CPU). |
 | `--full-scan` | Search the entire backup for metadata instead of trying the faster tail scan first. |
 | `--debug` | Print additional diagnostics to stderr. |
 | `-h, --help` | Show the complete option list. |

@@ -31,6 +31,22 @@ impl Lz4 {
     /// of allocation, so the caller's declared size is enforced here.
     pub fn decode_limited(&mut self, comp: &[u8], limit: usize) -> Result<Vec<u8>, String> {
         let base = self.work.len();
+        match self.decode_inner(comp, limit, base) {
+            Ok(decoded) => {
+                if self.work.len() > HISTORY {
+                    let drop = self.work.len() - HISTORY;
+                    self.work.drain(..drop);
+                }
+                Ok(decoded)
+            }
+            Err(error) => {
+                self.work.truncate(base);
+                Err(error)
+            }
+        }
+    }
+
+    fn decode_inner(&mut self, comp: &[u8], limit: usize, base: usize) -> Result<Vec<u8>, String> {
         let mut ip = 0usize;
         let fits = |produced: usize, extra: usize| {
             produced
@@ -112,12 +128,7 @@ impl Lz4 {
             }
         }
 
-        let decoded = self.work[base..].to_vec();
-        if self.work.len() > HISTORY {
-            let drop = self.work.len() - HISTORY;
-            self.work.drain(..drop);
-        }
-        Ok(decoded)
+        Ok(self.work[base..].to_vec())
     }
 }
 
@@ -146,6 +157,16 @@ mod tests {
                 "accepted {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn failed_block_does_not_pollute_previous_history() {
+        let mut decoder = Lz4::new();
+        assert_eq!(decoder.decode_limited(b"\x30ABC", 3).unwrap(), b"ABC");
+        assert!(decoder.decode_limited(&[0x10, b'X', 0, 0], 3).is_err());
+        // Offset 1 refers to the final byte of the last valid block. The
+        // malformed block's partial literal must not become dictionary data.
+        assert_eq!(decoder.decode_limited(&[0x01, 1, 0], 5).unwrap(), b"CCCCC");
     }
 
     #[test]
