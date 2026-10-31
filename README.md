@@ -6,7 +6,13 @@ to a disk.
 
 ## Install
 
-Requires a Rust toolchain. Clone the repository and install it with Cargo:
+Install the published command-line tool with Cargo:
+
+```bash
+cargo install adi2raw
+```
+
+This requires a Rust toolchain. To install the latest source from GitHub instead:
 
 ```bash
 git clone https://github.com/dickescheidt/adi2raw.git
